@@ -32,7 +32,9 @@ struct ContentView: View {
                                 .transition(.asymmetric(insertion: .move(edge: .leading).combined(with: .opacity), removal: .opacity))
                         case 1: TouchpadPanel()
                                 .transition(.asymmetric(insertion: .move(edge: .trailing).combined(with: .opacity), removal: .opacity))
-                        default: KeyboardPanel()
+                        case 2: KeyboardPanel()
+                                .transition(.asymmetric(insertion: .move(edge: .trailing).combined(with: .opacity), removal: .opacity))
+                        default: CastPanel()
                                 .transition(.asymmetric(insertion: .move(edge: .trailing).combined(with: .opacity), removal: .opacity))
                         }
                     }
@@ -306,11 +308,11 @@ struct NowCard: View {
 struct TabBar: View {
     @Binding var selection: Int
     @Namespace private var ns
-    private let names = ["Remote", "Touchpad", "Keyboard"]
+    private let names = ["Remote", "Touchpad", "Keys", "Cast"]
 
     var body: some View {
         HStack(spacing: 0) {
-            ForEach(0..<3, id: \.self) { i in
+            ForEach(0..<names.count, id: \.self) { i in
                 Button {
                     Haptics.tick()
                     withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) { selection = i }
