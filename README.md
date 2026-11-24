@@ -73,3 +73,6 @@ MIT © crimson
 
 The LG webOS pairing manifest (`lg_manifest.json`) comes from
 [aiopylgtv](https://github.com/bendavid/aiopylgtv) by Dennis Karpienski, MIT License.
+
+The QR codes in the Android app are drawn with
+[Nayuki's QR Code generator](https://github.com/nayuki/QR-Code-generator), MIT License.

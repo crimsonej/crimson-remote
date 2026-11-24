@@ -88,6 +88,31 @@ public class Bridge implements Mqtt.Listener {
         pool.shutdownNow();
     }
 
+    /**
+     * Every address other devices can open the bridge on, labelled by network:
+     * {"Wi-Fi", "http://192.168.1.8:8787"}, {"Hotspot", "http://192.168.43.1:8787"}.
+     */
+    public static java.util.List<String[]> addresses() {
+        java.util.List<String[]> out = new java.util.ArrayList<>();
+        try {
+            for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                String n = ni.getName();
+                boolean hotspot = n.startsWith("ap") || n.startsWith("swlan") || n.startsWith("softap") || n.equals("wlan1");
+                boolean wifi = !hotspot && n.startsWith("wlan");
+                boolean wired = n.startsWith("eth") || n.startsWith("rndis");
+                if (!hotspot && !wifi && !wired) continue;
+                for (InetAddress a : Collections.list(ni.getInetAddresses())) {
+                    if (!(a instanceof Inet4Address)) continue;
+                    String ip = a.getHostAddress();
+                    String label = hotspot ? "This phone's hotspot" : wifi ? "Wi-Fi" : "Cable / USB";
+                    out.add(new String[]{label, "http://" + ip + ":" + HTTP_PORT});
+                }
+            }
+        } catch (Exception ignored) {}
+        return out;
+    }
+
     /** http://<phone>:8787 on the current Wi-Fi, or null. */
     public static String address() {
         String ip = localIp();

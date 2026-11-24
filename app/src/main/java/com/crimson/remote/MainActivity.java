@@ -119,6 +119,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     @Override protected void onResume() {
         super.onResume();
         resumed = true;
+        if (prefs.getBoolean("bridge_on", false)) renderBridgeAddresses();   // addresses change with the network
         connect();
     }
 
@@ -1750,6 +1751,76 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     // ---------------------------------------------------------------- iPhone bridge
 
+    LinearLayout bridgeList;
+
+    /** One block per network the bridge can be reached on: label, link, QR code and buttons. */
+    void renderBridgeAddresses() {
+        if (bridgeList == null) return;
+        bridgeList.removeAllViews();
+        List<String[]> addrs = Bridge.addresses();
+        if (addrs.isEmpty()) {
+            bridgeList.addView(text(this, "Connect this phone to Wi-Fi or turn on its hotspot.", 13, SUB, 400), margins(-1, -2, 0, 12));
+            return;
+        }
+        for (final String[] a : addrs) {
+            LinearLayout block = new LinearLayout(this);
+            block.setOrientation(LinearLayout.VERTICAL);
+            block.setGravity(Gravity.CENTER_HORIZONTAL);
+            block.setPadding(dp(this, 12), dp(this, 12), dp(this, 12), dp(this, 12));
+            block.setBackground(shape(SURFACE2, dp(this, 16), 0, this));
+            TextView label = text(this, "If the iPhone is on: " + a[0], 12, SUB, 500);
+            block.addView(label);
+            TextView link = text(this, a[1], 16, TEXT, 700);
+            link.setTextIsSelectable(true);
+            block.addView(link, margins(-2, -2, 0, 6));
+            android.widget.ImageView qr = new android.widget.ImageView(this);
+            qr.setImageBitmap(qrBitmap(a[1]));
+            qr.setBackgroundColor(Color.WHITE);
+            int pad = dp(this, 8);
+            qr.setPadding(pad, pad, pad, pad);
+            block.addView(qr, margins(dp(this, 190), dp(this, 190), 0, 10));
+            LinearLayout btns = row();
+            TextView open = chip("Open here");
+            press(open, () -> {
+                try { startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(a[1]))); }
+                catch (Exception e) { toast("No browser found on this phone"); }
+            }, false);
+            btns.addView(open, chipLp(1));
+            TextView copy = chip("Copy");
+            press(copy, () -> {
+                ((android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
+                        .setPrimaryClip(android.content.ClipData.newPlainText("Crimson", a[1]));
+                toast("Link copied");
+            }, false);
+            btns.addView(copy, chipLp(1));
+            TextView share = chip("Share");
+            press(share, () -> {
+                Intent sh = new Intent(Intent.ACTION_SEND);
+                sh.setType("text/plain");
+                sh.putExtra(Intent.EXTRA_TEXT, "Crimson Remote: " + a[1]);
+                startActivity(Intent.createChooser(sh, "Send the remote link"));
+            }, false);
+            btns.addView(share, chipLp(1));
+            block.addView(btns, margins(-1, -2, 0, 10));
+            bridgeList.addView(block, margins(-1, -2, 0, 10));
+        }
+    }
+
+    /** A crisp QR code bitmap for a link. */
+    android.graphics.Bitmap qrBitmap(String text) {
+        io.nayuki.qrcodegen.QrCode q = io.nayuki.qrcodegen.QrCode.encodeText(text, io.nayuki.qrcodegen.QrCode.Ecc.MEDIUM);
+        int scale = 8, border = 2, size = (q.size + border * 2) * scale;
+        android.graphics.Bitmap bm = android.graphics.Bitmap.createBitmap(size, size, android.graphics.Bitmap.Config.RGB_565);
+        bm.eraseColor(Color.WHITE);
+        for (int y = 0; y < q.size; y++)
+            for (int x = 0; x < q.size; x++)
+                if (q.getModule(x, y))
+                    for (int dy = 0; dy < scale; dy++)
+                        for (int dx = 0; dx < scale; dx++)
+                            bm.setPixel((x + border) * scale + dx, (y + border) * scale + dy, Color.BLACK);
+        return bm;
+    }
+
     View bridgeCard() {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
@@ -1781,33 +1852,14 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
         final LinearLayout on = new LinearLayout(this);
         on.setOrientation(LinearLayout.VERTICAL);
-        final TextView addr = text(this, "", 17, TEXT, 700);
-        addr.setTextIsSelectable(true);
-        on.addView(addr, margins(-1, -2, 0, 14));
-        TextView how = text(this, "On the iPhone, open this in Safari, tap Share, then Add to Home Screen.", 12, FAINT, 400);
+        TextView how = text(this, "On the iPhone, point the Camera at the code for the network the iPhone is on, "
+                + "then tap the link. In Safari, tap Share, then Add to Home Screen.", 12, SUB, 400);
         how.setLineSpacing(0, 1.15f);
-        on.addView(how, margins(-1, -2, 0, 6));
-        LinearLayout btns = row();
-        TextView copy = chip("Copy link");
-        press(copy, () -> {
-            String a = Bridge.address();
-            if (a == null) { toast("Connect the phone to Wi-Fi first"); return; }
-            ((android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
-                    .setPrimaryClip(android.content.ClipData.newPlainText("Crimson", a));
-            toast("Link copied");
-        }, false);
-        btns.addView(copy, chipLp(1));
-        TextView share = chip("Share");
-        press(share, () -> {
-            String a = Bridge.address();
-            if (a == null) { toast("Connect the phone to Wi-Fi first"); return; }
-            Intent s = new Intent(Intent.ACTION_SEND);
-            s.setType("text/plain");
-            s.putExtra(Intent.EXTRA_TEXT, "Crimson Remote: " + a);
-            startActivity(Intent.createChooser(s, "Send the remote link"));
-        }, false);
-        btns.addView(share, chipLp(1));
-        on.addView(btns, margins(-1, -2, 0, 12));
+        on.addView(how, margins(-1, -2, 0, 12));
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        on.addView(list);
+        bridgeList = list;
         card.addView(on);
 
         final Runnable paint = () -> {
@@ -1816,8 +1868,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             knob.animate().translationX(enabled ? dp(this, 22) : 0).setDuration(240)
                     .setInterpolator(new android.view.animation.OvershootInterpolator(2f)).start();
             on.setVisibility(enabled ? View.VISIBLE : View.GONE);
-            String a = Bridge.address();
-            addr.setText(a == null ? "Connect the phone to Wi-Fi" : a);
+            if (enabled) renderBridgeAddresses();
         };
         press(toggle, () -> {
             boolean enabled = !prefs.getBoolean("bridge_on", false);
