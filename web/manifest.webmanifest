@@ -1,6 +1,6 @@
 {
   "name": "Crimson Remote",
-  "short_name": "Crimson",
+  "short_name": "Crimson Remote",
   "description": "A fast, good-looking remote for Hisense VIDAA TVs.",
   "start_url": "./",
   "scope": "./",
