@@ -284,8 +284,8 @@ class Tv:
     def pair(self, code):
         self._pub("ui_service", "authenticationcode", json.dumps({"authNum": str(code)}))
 
-    def wake(self):
-        mac = self.cfg.get("mac")
+    def wake(self, mac=None):
+        mac = mac or self.cfg.get("mac")
         if not mac:
             raise ValueError("Add the TV's MAC address in settings first")
         packet = b"\xff" * 6 + bytes.fromhex(mac.replace(":", "").replace("-", "")) * 16
@@ -412,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/source": lambda: TV.source(body),
                 "/api/app": lambda: TV.app(body),
                 "/api/pair": lambda: TV.pair(body["code"]),
-                "/api/wake": TV.wake,
+                "/api/wake": lambda: TV.wake(body.get("mac")),
                 "/api/refresh": TV.refresh,
                 "/api/settings": lambda: TV.settings(body.get("ip"), body.get("mac")),
             }
