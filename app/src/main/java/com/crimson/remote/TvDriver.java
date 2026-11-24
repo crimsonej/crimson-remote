@@ -53,6 +53,8 @@ public abstract class TvDriver {
     protected final String id;
     protected final Listener l;
     protected final SharedPreferences prefs;
+    /** Features this particular TV adds to its brand's set (learned while connecting). */
+    public final java.util.Set<String> extraFeatures = new java.util.HashSet<>();
 
     TvDriver(Context c, String ip, String id, Listener l) {
         this.ctx = c.getApplicationContext();
@@ -237,6 +239,8 @@ public abstract class TvDriver {
             l.onModel("Roku " + (model != null ? model : ""));
             l.onConnected();
             if ("true".equals(tag(info, "is-tv"))) {
+                extraFeatures.add("channels");
+                extraFeatures.add("inputList");
                 JSONArray src = new JSONArray();
                 String[][] inputs = {{"InputTuner", "TV"}, {"InputHDMI1", "HDMI 1"}, {"InputHDMI2", "HDMI 2"},
                         {"InputHDMI3", "HDMI 3"}, {"InputHDMI4", "HDMI 4"}, {"InputAV1", "AV"}};
@@ -646,6 +650,10 @@ public abstract class TvDriver {
         }
 
         @Override public boolean canSetVolume() { return true; }
+        /** Picture off, sound on. */
+        public void screenOff() {
+            try { request("ssap://com.webos.service.tvpower/power/turnOffScreen", new JSONObject().put("standbyMode", "active"), null); } catch (Exception ignored) {}
+        }
         @Override public void setVolume(int v) {
             try { request("ssap://audio/setVolume", new JSONObject().put("volume", v), null); } catch (Exception ignored) {}
         }

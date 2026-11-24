@@ -116,9 +116,20 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     }
 
 
+    final Runnable keepAlive = new Runnable() {
+        @Override public void run() {
+            if (!resumed) return;
+            if ((connState == ST_OFFLINE || connState == ST_NONE) && !userDisconnected) connect();
+            else if (screen == 3 && !scanning) new Thread(MainActivity.this::discover).start();
+            MAIN.postDelayed(this, 20000);
+        }
+    };
+
     @Override protected void onResume() {
         super.onResume();
         resumed = true;
+        MAIN.removeCallbacks(keepAlive);
+        MAIN.postDelayed(keepAlive, 20000);
         if (prefs.getBoolean("bridge_on", false)) renderBridgeAddresses();   // addresses change with the network
         connect();
     }
@@ -171,7 +182,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             if (list.isEmpty()) { setStateBg(ST_NONE, null); return; }
             if (list.size() == 1) { if (!openFound(list.get(0))) setStateBg(ST_OFFLINE, null); return; }
             setStateBg(ST_CHOOSE, null);
-            MAIN.post(this::devicesSheet);
+            MAIN.post(() -> showScreen(3, true));
         });
     }
 
@@ -190,6 +201,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     }
 
     void closeConnection() {
+        MAIN.post(features::clear);
         final Mqtt m = mqtt;
         mqtt = null;
         final TvDriver d = driver;
@@ -276,6 +288,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         if (m != null) m.close();
         driver = d;
         connectedIp = host;
+        applyFeatures(tv.brand, d.extraFeatures);
         if (connState != ST_PAIRING) setStateBg(ST_CONNECTED, null);
         MAIN.post(() -> { refreshHeader(); volBar.setEnabled(d.canSetVolume()); });
         return true;
@@ -291,6 +304,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             if (old != null) old.close();
             mqtt = m;
             connectedIp = host;
+            applyFeatures(TvDriver.HISENSE, null);
             MAIN.post(() -> { volBar.setEnabled(true); refreshHeader(); });
             m.subscribe("/remoteapp/mobile/#");
             refresh();
@@ -312,7 +326,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     /** Finds every TV on this Wi-Fi and reads its brand, name and MAC. Runs off the main thread. */
     void discover() {
         scanning = true;
-        MAIN.post(() -> { refreshHeader(); if (devicesList != null) renderDevices(); });
+        MAIN.post(() -> { refreshHeader(); if (devicesList != null) renderDevices(); renderDiscover(); });
         List<String> hosts = new ArrayList<>();
         try {
             String prefix = localPrefix();
@@ -347,7 +361,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         java.util.Collections.sort(found, (a, b) -> Integer.compare(lastOctet(a[0]), lastOctet(b[0])));
         synchronized (devices) { devices.clear(); devices.addAll(found); }
         scanning = false;
-        MAIN.post(() -> { refreshHeader(); if (devicesList != null) renderDevices(); });
+        MAIN.post(() -> { refreshHeader(); if (devicesList != null) renderDevices(); renderDiscover(); });
     }
 
     static int lastOctet(String ip) {
@@ -984,11 +998,13 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         try { ver = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception ignored) {}
         abt.addView(text(this, "Version " + ver + " · by crimson", 12, SUB, 400), margins(-2, -2, 0, 3));
         abr.addView(abt);
+        abr.setBackground(ripple(shape(0, dp(this, 18), 0, this)));
         ab.addView(abr);
         c.addView(ab);
 
         final android.app.Dialog d = sheet(c);
-        press(devRow, () -> { d.dismiss(); devicesSheet(); }, false);
+        press(devRow, () -> { d.dismiss(); showScreen(3, true); }, false);
+        press(abr, () -> { d.dismiss(); aboutSheet(); }, false);
         press(save, () -> {
             final String host = ipBox.getText().toString().trim();
             if (!host.matches("\\d{1,3}(\\.\\d{1,3}){3}")) { toast("Type an address like 192.168.1.20"); return; }
@@ -1032,11 +1048,9 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setGravity(Gravity.CENTER_HORIZONTAL);
-        FrameLayout mark = new FrameLayout(this);
-        mark.setBackground(gradient(CRIMSON, CRIMSON_DARK, dp(this, 22)));
+        View mark = new MarkView(this, true);
         mark.setElevation(dp(this, 10));
-        mark.addView(new Icon(this, Icon.REMOTE, Color.WHITE), new FrameLayout.LayoutParams(dp(this, 40), dp(this, 40), Gravity.CENTER));
-        col.addView(mark, new LinearLayout.LayoutParams(dp(this, 84), dp(this, 84)));
+        col.addView(mark, new LinearLayout.LayoutParams(dp(this, 108), dp(this, 108)));
         TextView name = text(this, "CRIMSON", 34, TEXT, 700);
         name.setLetterSpacing(0.05f);
         col.addView(name, margins(-2, -2, 0, 20));
@@ -1066,9 +1080,9 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     // Screens and the bottom tab bar.
     FrameLayout screensFrame;
-    View[] screens = new View[3];
-    TextView[] navLabels = new TextView[3];
-    Icon[] navIcons = new Icon[3];
+    View[] screens = new View[4];
+    TextView[] navLabels = new TextView[4];
+    Icon[] navIcons = new Icon[4];
     int screen;
     TextView screenLabel;
     View headerDot;
@@ -1091,6 +1105,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         screens[0] = scrolled(remoteScreen());
         screens[1] = scrolled(appsScreen());
         screens[2] = scrolled(castScreen());
+        screens[3] = scrolled(discoverScreen());
         for (View v : screens) screensFrame.addView(v, new FrameLayout.LayoutParams(-1, -1));
         showScreen(0, false);
 
@@ -1145,7 +1160,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.END);
         nameRow.addView(title);
-        press(nameRow, this::devicesSheet, false);
+        press(nameRow, () -> showScreen(3, true), false);
         nameRow.setContentDescription("Choose TV");
         left.addView(nameRow, margins(-2, -2, 0, 6));
         h.addView(left, new LinearLayout.LayoutParams(0, -2, 1));
@@ -1189,9 +1204,9 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         bg.setColor(style == 0 ? (dark ? 0xE6101015 : 0xEFFFFFFF) : SURFACE);
         bg.setStroke(dp(this, 1), STROKE);
         bar.setBackground(bg);
-        String[] names = {"Remote", "Apps", "Cast"};
-        int[] icons = {Icon.REMOTE, Icon.GRID, Icon.CASTTV};
-        for (int i = 0; i < 3; i++) {
+        String[] names = {"Remote", "Apps", "Cast", "TVs"};
+        int[] icons = {Icon.REMOTE, Icon.GRID, Icon.CASTTV, Icon.TV};
+        for (int i = 0; i < 4; i++) {
             final int idx = i;
             LinearLayout item = new LinearLayout(this);
             item.setOrientation(LinearLayout.VERTICAL);
@@ -1211,9 +1226,9 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     void showScreen(int idx, boolean animate) {
         int from = screen;
         screen = idx;
-        String[] labels = {"REMOTE", "APPS", "CAST"};
+        String[] labels = {"REMOTE", "APPS", "CAST", "TVS"};
         screenLabel.setText("CRIMSON · " + labels[idx]);
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             boolean on = i == idx;
             navLabels[i].setTextColor(on ? CRIMSON : SUB);
             navIcons[i].setColor(on ? CRIMSON : SUB);
@@ -1229,6 +1244,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             } else v.setVisibility(View.GONE);
         }
         if (idx == 2) startCastPolling();
+        if (idx == 3) { renderDiscover(); if (!scanning) new Thread(this::discover).start(); }
     }
 
     View nowCard() {
@@ -1300,11 +1316,10 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         pw.setContentDescription("Power");
         top.addView(pw);
         top.addView(flex());
-        top.addView(labeledKey(Icon.INPUT, "Input", this::chooseInput));
-        top.addView(flex());
+        if (has("inputList")) { top.addView(labeledKey(Icon.INPUT, "Input", this::chooseInput)); top.addView(flex()); }
+        else if (has("sourceKey")) { top.addView(labeledKey(Icon.INPUT, "Source", () -> key("KEY_SOURCE"))); top.addView(flex()); }
         top.addView(labeledKey(Icon.MUTE, "Mute", () -> key("KEY_MUTE")));
-        top.addView(flex());
-        top.addView(labeledKey(Icon.KEYBOARD, "Keyboard", this::keyboardSheet));
+        if (has("keyboard")) { top.addView(flex()); top.addView(labeledKey(Icon.KEYBOARD, "Keyboard", this::keyboardSheet)); }
         controls.addView(top);
 
         // D-pad or touchpad, in the same spot.
@@ -1373,15 +1388,159 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         }, false);
         media.addView(pp, weight());
         media.addView(mediaBtn("▶▶", "KEY_FORWARDS"), weight());
-        controls.addView(media, margins(-1, dp(this, 54), 0, 14));
+        if (has("media")) controls.addView(media, margins(-1, dp(this, 54), 0, 14));
 
         c.addView(controls, margins(-1, -2, 0, 18));
+        if (has("audioOnly") || has("speakerVolume") || has("tvSettings")) c.addView(featuresCard(), margins(-1, -2, 0, 18));
         pages = null;
         controlsCard = controls;
         return c;
     }
 
     View controlsCard;
+
+    // ---------------------------------------------------------------- features
+
+    /** What the connected TV supports; the remote shows only these. */
+    final java.util.Set<String> features = new java.util.HashSet<>();
+
+    static java.util.Set<String> brandFeatures(String brand) {
+        String[] f;
+        switch (brand == null ? TvDriver.HISENSE : brand) {
+            case TvDriver.ROKU: f = new String[]{"power", "mute", "apps", "keyboard", "media"}; break;
+            case TvDriver.SAMSUNG: f = new String[]{"power", "mute", "channels", "numbers", "colorKeys", "sourceKey", "apps", "keyboard", "media", "cast"}; break;
+            case TvDriver.LG: f = new String[]{"power", "volumeSlider", "mute", "channels", "numbers", "colorKeys", "inputList", "apps", "keyboard", "pointer", "media", "cast", "audioOnly"}; break;
+            default: // Hisense VIDAA: Audio only and speaker volume go through its quick menu (tested on a 50A6).
+                f = new String[]{"power", "volumeSlider", "mute", "channels", "numbers", "colorKeys", "inputList", "apps", "keyboard", "pointer", "media", "cast", "audioOnly", "speakerVolume", "tvSettings"};
+        }
+        return new java.util.HashSet<>(java.util.Arrays.asList(f));
+    }
+
+    boolean has(String f) {
+        if (!features.isEmpty()) return features.contains(f);
+        TvStore.Tv t = currentTv();
+        return brandFeatures(t != null ? t.brand : TvDriver.HISENSE).contains(f);
+    }
+
+    /** Called when a TV connects: work out its features and rebuild the remote to match. */
+    void applyFeatures(String brand, java.util.Set<String> extra) {
+        java.util.Set<String> f = brandFeatures(brand);
+        if (extra != null) f.addAll(extra);
+        MAIN.post(() -> {
+            if (f.equals(features)) return;
+            features.clear();
+            features.addAll(f);
+            rebuildRemote();
+        });
+    }
+
+    void rebuildRemote() {
+        if (screens[0] == null) return;
+        ScrollView sv = (ScrollView) screens[0];
+        sv.removeAllViews();
+        sv.addView(remoteScreen());
+        renderConnection();
+        if (mqtt != null) refresh(); else if (driver != null) driver.refresh();
+    }
+
+    /** Plays keys one after another, for features reached through the TV's own menus. */
+    void runKeys(int gapMs, String... keys) {
+        new Thread(() -> {
+            for (String k : keys) {
+                MAIN.post(() -> key(k));
+                try { Thread.sleep(gapMs); } catch (InterruptedException ignored) {}
+            }
+        }).start();
+    }
+
+    void audioOnly() {
+        if (driver instanceof TvDriver.Lg) { ((TvDriver.Lg) driver).screenOff(); }
+        else runKeys(900, "KEY_MENU", "KEY_DOWN", "KEY_OK");
+        toast("Picture off · press any button to bring it back");
+    }
+
+    void openTvSettings() {
+        TvStore.Tv t = currentTv();
+        if (t != null && TvDriver.HISENSE.equals(t.brand)) runKeys(800, "KEY_MENU", "KEY_DOWN", "KEY_DOWN", "KEY_DOWN", "KEY_OK");
+        else key("KEY_MENU");
+    }
+
+    void speakerSheet() {
+        runKeys(900, "KEY_MENU", "KEY_OK");   // opens the external speaker (headphone) volume
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        c.addView(text(this, "Speaker volume", 22, TEXT, 700));
+        TextView sub = text(this, "Adjusts the external speakers or headphones. Watch the slider on the TV.", 13, SUB, 400);
+        sub.setGravity(Gravity.CENTER);
+        c.addView(sub, margins(-1, -2, 0, 6));
+        LinearLayout r = row();
+        r.setGravity(Gravity.CENTER);
+        for (String[] k : new String[][]{{"−", "KEY_LEFT", "Speaker volume down"}, {"+", "KEY_RIGHT", "Speaker volume up"}}) {
+            TextView b = text(this, k[0], 30, TEXT, 400);
+            b.setGravity(Gravity.CENTER);
+            GradientDrawable g = new GradientDrawable();
+            g.setShape(GradientDrawable.OVAL);
+            g.setColor(SURFACE2);
+            g.setStroke(dp(this, 1), STROKE);
+            b.setBackground(ripple(g));
+            b.setContentDescription(k[2]);
+            press(b, () -> key(k[1]), true);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(this, 76), dp(this, 76));
+            lp.setMargins(dp(this, 18), 0, dp(this, 18), 0);
+            r.addView(b, lp);
+        }
+        c.addView(r, margins(-1, -2, 0, 20));
+        TextView done = text(this, "Done", 16, Color.WHITE, 700);
+        done.setGravity(Gravity.CENTER);
+        done.setBackground(ripple(gradient(CRIMSON, CRIMSON_DARK, dp(this, 25))));
+        c.addView(done, margins(-1, dp(this, 50), 0, 22));
+        final android.app.Dialog d = sheet(c);
+        press(done, d::dismiss, false);
+        d.setOnDismissListener(x -> key("KEY_RETURNS"));
+    }
+
+    View featuresCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(this, 16), dp(this, 14), dp(this, 16), dp(this, 16));
+        card.setBackground(shape(SURFACE, dp(this, 24), STROKE, this));
+        TextView label = text(this, "TV FEATURES", 11, FAINT, 700);
+        label.setLetterSpacing(0.16f);
+        card.addView(label);
+        LinearLayout r = row();
+        if (has("audioOnly")) r.addView(featureTile(Icon.SCREENOFF, "Audio only", "Picture off", this::audioOnly), weightLp());
+        if (has("speakerVolume")) r.addView(featureTile(Icon.SPEAKER, "Speakers", "External volume", this::speakerSheet), weightLp());
+        if (has("tvSettings")) r.addView(featureTile(Icon.SLIDERS, "TV settings", "Sound, picture", this::openTvSettings), weightLp());
+        card.addView(r, margins(-1, -2, 0, 12));
+        return card;
+    }
+
+    LinearLayout.LayoutParams weightLp() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1);
+        lp.leftMargin = lp.rightMargin = dp(this, 4);
+        return lp;
+    }
+
+    View featureTile(int icon, String title, String sub, Runnable r) {
+        LinearLayout t = new LinearLayout(this);
+        t.setOrientation(LinearLayout.VERTICAL);
+        t.setPadding(dp(this, 12), dp(this, 12), dp(this, 12), dp(this, 12));
+        t.setBackground(ripple(shape(SURFACE2, dp(this, 18), 0, this)));
+        FrameLayout ic = new FrameLayout(this);
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(CRIMSON_SOFT);
+        ic.setBackground(g);
+        ic.addView(new Icon(this, icon, CRIMSON), new FrameLayout.LayoutParams(dp(this, 18), dp(this, 18), Gravity.CENTER));
+        t.addView(ic, new LinearLayout.LayoutParams(dp(this, 36), dp(this, 36)));
+        t.addView(text(this, title, 13, TEXT, 500), margins(-2, -2, 0, 8));
+        TextView s2 = text(this, sub, 11, SUB, 400);
+        s2.setSingleLine(true);
+        t.addView(s2, margins(-2, -2, 0, 2));
+        press(t, () -> { buzz(this, 10); r.run(); }, false);
+        return t;
+    }
 
     View labeledKey(int icon, String label, Runnable r) {
         LinearLayout col = new LinearLayout(this);
@@ -1407,7 +1566,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         mid.addView(flex());
         mid.addView(dpad());
         mid.addView(flex());
-        mid.addView(rocker("CH", "KEY_CHANNELUP", "KEY_CHANNELDOWN"));
+        if (has("channels")) mid.addView(rocker("CH", "KEY_CHANNELUP", "KEY_CHANNELDOWN"));
+        else mid.addView(new View(this), new LinearLayout.LayoutParams(dp(this, 58), dp(this, 1)));
         return mid;
     }
 
@@ -1435,7 +1595,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         }, false);
         FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams(dp(this, 34), dp(this, 34), Gravity.TOP | Gravity.END);
         plp.setMargins(0, dp(this, 10), dp(this, 10), 0);
-        f.addView(pointer, plp);
+        TvStore.Tv ct = currentTv();
+        if (ct == null || TvDriver.HISENSE.equals(ct.brand)) f.addView(pointer, plp);
         return f;
     }
 
@@ -1514,6 +1675,228 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         f.addView(child, new FrameLayout.LayoutParams(dp(this, 26), dp(this, 26), Gravity.CENTER));
         f.setLayoutParams(new LinearLayout.LayoutParams(size, size));
         return f;
+    }
+
+    // ---------------------------------------------------------------- TVs (discover) screen
+
+    LinearLayout discoverList;
+    TextView discoverStatus;
+    RadarView radar;
+
+    View discoverScreen() {
+        LinearLayout c = screenColumn();
+        LinearLayout hero = new LinearLayout(this);
+        hero.setOrientation(LinearLayout.VERTICAL);
+        hero.setGravity(Gravity.CENTER_HORIZONTAL);
+        hero.setPadding(dp(this, 16), dp(this, 18), dp(this, 16), dp(this, 18));
+        hero.setBackground(shape(SURFACE, dp(this, 28), STROKE, this));
+        radar = new RadarView(this);
+        hero.addView(radar, new LinearLayout.LayoutParams(-1, dp(this, 170)));
+        discoverStatus = text(this, "", 14, SUB, 500);
+        discoverStatus.setGravity(Gravity.CENTER);
+        hero.addView(discoverStatus, margins(-1, -2, 0, 10));
+        TextView scan = text(this, "↻  Scan again", 14, Color.WHITE, 500);
+        scan.setGravity(Gravity.CENTER);
+        scan.setPadding(dp(this, 20), 0, dp(this, 20), 0);
+        scan.setBackground(ripple(gradient(CRIMSON, CRIMSON_DARK, dp(this, 21))));
+        press(scan, () -> { if (!scanning) new Thread(this::discover).start(); }, false);
+        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-2, dp(this, 42));
+        sl.topMargin = dp(this, 14);
+        hero.addView(scan, sl);
+        c.addView(hero);
+        discoverList = new LinearLayout(this);
+        discoverList.setOrientation(LinearLayout.VERTICAL);
+        discoverList.setLayoutTransition(new LayoutTransition());
+        c.addView(discoverList, margins(-1, -2, 0, 8));
+        TextView note = text(this, "Crimson works with Hisense (VIDAA), Roku, Samsung (2016 and later) and LG (webOS) TVs on the same Wi-Fi.", 12, FAINT, 400);
+        c.addView(note, margins(-1, -2, 0, 16));
+        return c;
+    }
+
+    /** Fills the TVs screen: saved TVs (with whether they're available) and new TVs found. */
+    void renderDiscover() {
+        if (discoverList == null) return;
+        radar.setScanning(scanning);
+        discoverStatus.setText(scanning ? "Looking for TVs on this Wi-Fi…" : devices.size() + (devices.size() == 1 ? " TV" : " TVs") + " found on this Wi-Fi");
+        discoverList.removeAllViews();
+        LinearLayout keep = devicesList;
+        devicesList = discoverList;   // reuse the TV list rows
+        List<String[]> found;
+        synchronized (devices) { found = new ArrayList<>(devices); }
+        List<TvStore.Tv> saved = store.all();
+        TvStore.Tv cur = currentTv();
+        if (!saved.isEmpty()) {
+            discoverList.addView(sectionTitle("Your TVs"));
+            for (final TvStore.Tv t : saved) {
+                String[] here = null;
+                for (String[] d : found) if ((!t.mac.isEmpty() && t.mac.equals(d[4])) || (t.mac.isEmpty() && d[0].equals(t.ip))) here = d;
+                boolean connected = cur != null && cur.id.equals(t.id) && connState == ST_CONNECTED;
+                final String[] fnow = here;
+                deviceRow(t.name != null && !t.name.isEmpty() ? t.name : brandLabel(t.brand) + " TV",
+                        brandLabel(t.brand) + (t.model != null && !t.model.isEmpty() ? " · " + t.model : ""),
+                        connected ? "Connected" : here != null ? "Available" : scanning ? "Checking…" : "Not found", connected,
+                        () -> { if (fnow != null) selectFound(fnow); else selectSaved(t); },
+                        () -> confirmForget(t));
+            }
+        }
+        List<String[]> fresh = new ArrayList<>();
+        for (String[] d : found) {
+            boolean known = false;
+            for (TvStore.Tv t : saved) if ((!t.mac.isEmpty() && t.mac.equals(d[4])) || (t.mac.isEmpty() && t.ip.equals(d[0]))) known = true;
+            if (!known) fresh.add(d);
+        }
+        if (!fresh.isEmpty()) {
+            discoverList.addView(sectionTitle(saved.isEmpty() ? "Found on this Wi-Fi" : "New TVs found"));
+            for (final String[] d : fresh)
+                deviceRow(d[1], brandLabel(d[3]) + (d[2] != null ? " · " + d[2] : "") + " · " + d[0], "Connect", false, () -> selectFound(d), null);
+        }
+        devicesList = keep;
+    }
+
+    /** Expanding rings while scanning. */
+    class RadarView extends View {
+        final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG), dot = new Paint(Paint.ANTI_ALIAS_FLAG);
+        float t;
+        ValueAnimator anim;
+        RadarView(Context c) {
+            super(c);
+            ring.setStyle(Paint.Style.STROKE);
+            ring.setStrokeWidth(dp(c, 1.5f));
+            ring.setColor(CRIMSON);
+            dot.setColor(CRIMSON);
+            anim = ValueAnimator.ofFloat(0f, 1f);
+            anim.setDuration(2200);
+            anim.setRepeatCount(ValueAnimator.INFINITE);
+            anim.addUpdateListener(a -> { t = (float) a.getAnimatedValue(); invalidate(); });
+        }
+        void setScanning(boolean on) { if (on && !anim.isStarted()) anim.start(); else if (!on) { anim.cancel(); t = 0; invalidate(); } }
+        @Override protected void onDraw(Canvas c) {
+            float cx = getWidth() / 2f, cy = getHeight() / 2f, max = Math.min(cx, cy);
+            if (anim.isRunning()) for (int i = 0; i < 3; i++) {
+                float k = (t + i / 3f) % 1f;
+                ring.setAlpha((int) ((1 - k) * 160));
+                c.drawCircle(cx, cy, max * (0.25f + 0.75f * k), ring);
+            }
+            dot.setShader(new android.graphics.LinearGradient(cx - 32, cy - 32, cx + 32, cy + 32, CRIMSON, CRIMSON_DARK, android.graphics.Shader.TileMode.CLAMP));
+            c.drawCircle(cx, cy, dp(getContext(), 32), dot);
+            Paint w = new Paint(Paint.ANTI_ALIAS_FLAG);
+            w.setColor(Color.WHITE);
+            w.setStyle(Paint.Style.STROKE);
+            w.setStrokeWidth(dp(getContext(), 2.2f));
+            w.setStrokeCap(Paint.Cap.ROUND);
+            float r = dp(getContext(), 8);
+            c.drawCircle(cx, cy, dp(getContext(), 3), dot);
+            c.drawArc(new RectF(cx - r, cy - r, cx + r, cy + r), -45, 90, false, w);
+            c.drawArc(new RectF(cx - r, cy - r, cx + r, cy + r), 135, 90, false, w);
+            r = dp(getContext(), 14);
+            c.drawArc(new RectF(cx - r, cy - r, cx + r, cy + r), -45, 90, false, w);
+            c.drawArc(new RectF(cx - r, cy - r, cx + r, cy + r), 135, 90, false, w);
+        }
+    }
+
+    /** The Crimson mark: a crimson C that sweeps in around a play symbol. */
+    static class MarkView extends View {
+        final Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG), arc = new Paint(Paint.ANTI_ALIAS_FLAG), glow = new Paint(Paint.ANTI_ALIAS_FLAG), play = new Paint(Paint.ANTI_ALIAS_FLAG);
+        float sweep, pop;
+        MarkView(Context c, boolean animate) {
+            super(c);
+            arc.setStyle(Paint.Style.STROKE);
+            arc.setStrokeCap(Paint.Cap.ROUND);
+            glow.setStyle(Paint.Style.STROKE);
+            glow.setStrokeCap(Paint.Cap.ROUND);
+            glow.setColor(Ui.CRIMSON);
+            glow.setMaskFilter(new android.graphics.BlurMaskFilter(30, android.graphics.BlurMaskFilter.Blur.NORMAL));
+            play.setColor(Color.WHITE);
+            setLayerType(LAYER_TYPE_SOFTWARE, null);
+            if (!animate) { sweep = 1; pop = 1; return; }
+            ValueAnimator a = ValueAnimator.ofFloat(0, 1);
+            a.setDuration(900);
+            a.setInterpolator(new android.view.animation.DecelerateInterpolator());
+            a.addUpdateListener(v -> { sweep = (float) v.getAnimatedValue(); invalidate(); });
+            a.start();
+            ValueAnimator b = ValueAnimator.ofFloat(0, 1);
+            b.setStartDelay(550);
+            b.setDuration(500);
+            b.setInterpolator(new android.view.animation.OvershootInterpolator(2.4f));
+            b.addUpdateListener(v -> { pop = (float) v.getAnimatedValue(); invalidate(); });
+            b.start();
+        }
+        @Override protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight(), s = Math.min(w, h);
+            bg.setShader(new android.graphics.RadialGradient(w * 0.32f, h * 0.28f, s * 1.05f, 0xFF600A20, 0xFF0A0307, android.graphics.Shader.TileMode.CLAMP));
+            c.drawRoundRect(new RectF(0, 0, w, h), s * 0.24f, s * 0.24f, bg);
+            float r = s * 0.30f, cx = w / 2, cy = h / 2;
+            RectF box = new RectF(cx - r, cy - r, cx + r, cy + r);
+            arc.setStrokeWidth(s * 0.11f);
+            glow.setStrokeWidth(s * 0.11f);
+            arc.setShader(new android.graphics.LinearGradient(cx - r, cy - r, cx + r, cy + r, 0xFFFF5C7A, Ui.CRIMSON_DARK, android.graphics.Shader.TileMode.CLAMP));
+            float sw = 264 * sweep;
+            c.drawArc(box, 48, sw, false, glow);
+            c.drawArc(box, 48, sw, false, arc);
+            if (pop > 0) {
+                c.save();
+                c.scale(pop, pop, cx, cy);
+                android.graphics.Path t = new android.graphics.Path();
+                float ps = s * 0.13f, px = cx - ps * 0.42f;
+                t.moveTo(px, cy - ps * 0.72f); t.lineTo(px + ps * 1.22f, cy); t.lineTo(px, cy + ps * 0.72f); t.close();
+                c.drawPath(t, play);
+                c.restore();
+            }
+        }
+    }
+
+    void aboutSheet() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        c.addView(new MarkView(this, true), new LinearLayout.LayoutParams(dp(this, 104), dp(this, 104)));
+        c.addView(text(this, "Crimson Remote", 24, TEXT, 700), margins(-2, -2, 0, 16));
+        String ver = "?";
+        long code = 0;
+        try {
+            android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            ver = pi.versionName;
+            code = Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode;
+        } catch (Exception ignored) {}
+        c.addView(text(this, "Version " + ver + " (" + code + ")", 14, SUB, 500), margins(-2, -2, 0, 6));
+        c.addView(text(this, "Made by crimson", 13, FAINT, 400), margins(-2, -2, 0, 4));
+        LinearLayout info = group();
+        TvStore.Tv t = currentTv();
+        info.addView(infoRow("Connected TV", connState == ST_CONNECTED ? displayName() : "None"));
+        if (t != null) {
+            info.addView(infoRow("Brand", brandLabel(t.brand)));
+            if (t.model != null && !t.model.isEmpty()) info.addView(infoRow("Model", t.model));
+            info.addView(infoRow("Address", t.ip));
+            info.addView(infoRow("Can turn on", t.canWake() ? "Yes" : "Not yet"));
+        }
+        info.addView(infoRow("Features", features.isEmpty() ? "—" : features.size() + " available"));
+        c.addView(info, margins(-1, -2, 0, 20));
+        LinearLayout links = group();
+        links.addView(linkRow("Project on GitHub", "https://github.com/crimsonej/crimson-remote"));
+        links.addView(linkRow("Latest release", "https://github.com/crimsonej/crimson-remote/releases/latest"));
+        c.addView(links, margins(-1, -2, 0, 12));
+        TextView credits = text(this, "Credits: LG pairing manifest from aiopylgtv (MIT). QR codes by Nayuki's QR Code generator (MIT).", 12, SUB, 400);
+        credits.setPadding(dp(this, 4), 0, dp(this, 4), 0);
+        c.addView(credits, margins(-1, -2, 0, 14));
+        sheet(c);
+    }
+
+    View infoRow(String k, String v) {
+        LinearLayout r = row();
+        r.setPadding(dp(this, 16), dp(this, 13), dp(this, 16), dp(this, 13));
+        r.addView(text(this, k, 14, SUB, 400), new LinearLayout.LayoutParams(0, -2, 1));
+        r.addView(text(this, v, 14, TEXT, 500));
+        return r;
+    }
+
+    View linkRow(String title, String url) {
+        LinearLayout r = row();
+        r.setPadding(dp(this, 16), dp(this, 14), dp(this, 16), dp(this, 14));
+        r.setBackground(ripple(shape(0, dp(this, 18), 0, this)));
+        r.addView(text(this, title, 14, TEXT, 500), new LinearLayout.LayoutParams(0, -2, 1));
+        r.addView(text(this, "↗", 15, CRIMSON, 700));
+        press(r, () -> { try { startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))); } catch (Exception ignored) {} }, false);
+        return r;
     }
 
     // ---------------------------------------------------------------- Cast screen
@@ -1786,6 +2169,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         c.addView(text(this, "More buttons", 22, TEXT, 700));
         String[][] nums = {{"1", "2", "3"}, {"4", "5", "6"}, {"7", "8", "9"}, {"Info", "0", "Subtitles"}};
         for (String[] r : nums) {
+            if (!has("numbers") && !r[0].equals("Info")) continue;
             LinearLayout rr = row();
             for (String n : r) {
                 String k = n.equals("Info") ? "KEY_INFO" : n.equals("Subtitles") ? "KEY_SUBTITLE" : "KEY_" + n;
@@ -1813,7 +2197,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             lp.setMargins(dp(this, 6), dp(this, 12), dp(this, 6), 0);
             colours.addView(col, lp);
         }
-        c.addView(colours);
+        if (has("colorKeys")) c.addView(colours);
         TextView exit = text(this, "Exit", 14, TEXT, 500);
         exit.setGravity(Gravity.CENTER);
         exit.setBackground(ripple(shape(SURFACE, dp(this, 18), STROKE, this)));
@@ -2316,7 +2700,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     /** Small line icons drawn in code so they match on every phone. */
     static class Icon extends View {
         static final int TV = 0, GEAR = 1, SUN = 2, MOON = 3, HALF = 4, REMOTE = 5, PLAY = 6, MIRROR = 7, DESKTOP = 8,
-                GRID = 9, CASTTV = 10, INPUT = 11, MUTE = 12, KEYBOARD = 13, BACK = 14, HOME = 15, MENU = 16, DOTS = 17;
+                GRID = 9, CASTTV = 10, INPUT = 11, MUTE = 12, KEYBOARD = 13, BACK = 14, HOME = 15, MENU = 16, DOTS = 17,
+                SCREENOFF = 18, SPEAKER = 19, SLIDERS = 20;
         final int kind;
         void setColor(int c) { p.setColor(c); f.setColor(c); invalidate(); }
         final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG), f = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -2435,6 +2820,22 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                 }
                 case MENU:
                     for (int i = 0; i < 3; i++) c.drawLine(w * 0.15f, h * (0.28f + 0.22f * i), w * 0.85f, h * (0.28f + 0.22f * i), p);
+                    break;
+                case SCREENOFF:
+                    c.drawRoundRect(new RectF(s, h * 0.18f, w - s, h * 0.72f), w * 0.08f, w * 0.08f, p);
+                    c.drawLine(w * 0.12f, h * 0.1f, w * 0.88f, h * 0.88f, p);
+                    break;
+                case SPEAKER:
+                    c.drawRoundRect(new RectF(w * 0.22f, s, w * 0.78f, h - s), w * 0.1f, w * 0.1f, p);
+                    c.drawCircle(w / 2, h * 0.62f, w * 0.15f, p);
+                    c.drawCircle(w / 2, h * 0.26f, w * 0.06f, f);
+                    break;
+                case SLIDERS:
+                    for (int i = 0; i < 3; i++) {
+                        float y = h * (0.24f + 0.26f * i);
+                        c.drawLine(w * 0.1f, y, w * 0.9f, y, p);
+                        c.drawCircle(w * (i == 1 ? 0.65f : 0.35f), y, w * 0.08f, f);
+                    }
                     break;
                 case DOTS:
                     for (int i = 0; i < 3; i++) c.drawCircle(w * (0.22f + 0.28f * i), h * 0.5f, w * 0.07f, f);
