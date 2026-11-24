@@ -196,7 +196,9 @@ struct AirPlayButton: UIViewRepresentable {
 struct CastPanel: View {
     @EnvironmentObject var tv: TVController
     @StateObject private var caster = Caster()
+    @ObservedObject private var desktop = DesktopModel.shared
     @State private var item: PhotosPickerItem?
+    @State private var showDesktop = false
 
     var body: some View {
         VStack(spacing: 14) {
@@ -227,6 +229,19 @@ struct CastPanel: View {
                 .frame(height: 44)
                 .card(radius: 22, fill: Theme.surface2)
             }
+            card(icon: "desktopcomputer", title: "Crimson Desktop",
+                 text: desktop.connected ? "The TV is showing the Crimson desktop. Open the controls to use your iPhone as its trackpad and keyboard."
+                     : "Connect the iPhone to the TV with AirPlay or an HDMI adapter cable, and the TV shows a desktop with a web browser.") {
+                Button { Haptics.tap(); showDesktop = true } label: {
+                    actionLabel(desktop.connected ? "Open desktop controls" : "Open controls")
+                }
+                .buttonStyle(PressStyle(scale: 0.97))
+            }
+        }
+        .fullScreenCover(isPresented: $showDesktop) {
+            DesktopControls()
+                .environmentObject(DesktopModel.shared)
+                .background(Theme.bg.ignoresSafeArea())
         }
         .onChange(of: item) { newItem in
             guard let newItem else { return }

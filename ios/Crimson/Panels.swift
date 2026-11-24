@@ -446,6 +446,13 @@ struct InputSheet: View {
                 .font(.system(size: 13)).foregroundStyle(Theme.sub)
                 .padding(.bottom, 10)
             if tv.sources.isEmpty {
+                Button { tv.key("KEY_SOURCE") } label: {
+                    Text("Press the TV's Source button").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
+                        .frame(maxWidth: .infinity).frame(height: 44)
+                        .background(Capsule().fill(Theme.crimsonGradient))
+                }
+                .buttonStyle(PressStyle(scale: 0.97))
+                .padding(.bottom, 8)
                 Text("Loading inputs…").foregroundStyle(Theme.sub).onAppear { tv.refresh() }
             }
             ForEach(tv.sources) { s in

@@ -279,6 +279,8 @@ struct NowCard: View {
                     if !editing { tv.setVolume(tv.volume, force: true) } else { Haptics.tick() }
                 }
                 .tint(Theme.crimson)
+                .disabled(!tv.canSetVolume)
+                .opacity(tv.canSetVolume ? 1 : 0.4)
                 Text("\(Int(tv.volume))")
                     .font(.system(size: 13, weight: .semibold).monospacedDigit())
                     .foregroundStyle(Theme.text)

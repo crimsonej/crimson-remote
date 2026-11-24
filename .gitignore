@@ -7,3 +7,4 @@ ios/Crimson.xcodeproj/
 ios/build/
 ios/Payload/
 *.ipa
+ios/Crimson/Info.plist

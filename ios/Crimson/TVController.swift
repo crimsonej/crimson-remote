@@ -10,6 +10,8 @@ struct TVApp: Identifiable, Hashable {
     let appId: String
     let urlType: Int
     let storeType: Int
+    /// An icon the TV itself serves (Roku, LG), preferred over the site icon.
+    var iconURL: String? = nil
 
     var displayName: String {
         name.trimmingCharacters(in: .whitespaces)
@@ -18,6 +20,7 @@ struct TVApp: Identifiable, Hashable {
 
     /// Each service's own site icon stands in for its logo.
     var logoURL: URL? {
+        if let iconURL, !iconURL.isEmpty, let u = URL(string: iconURL) { return u }
         let n = displayName.lowercased()
         let known: [(String, String)] = [
             ("youtube", "youtube.com"), ("netflix", "netflix.com"), ("prime", "primevideo.com"),
@@ -42,6 +45,7 @@ struct TVDevice: Identifiable, Hashable {
     let ip: String
     var name: String
     var model: String?
+    var brand: TVBrand = .hisense
 }
 
 struct TVSource: Identifiable, Hashable {
@@ -79,6 +83,10 @@ final class TVController: ObservableObject {
     }
 
     private var client: MQTTClient?
+    /// The non-Hisense TV being controlled (Roku, Samsung, LG), if any.
+    private var driver: TVDriver?
+    var isLive: Bool { client?.isConnected == true || driver?.isConnected == true }
+    @Published var canSetVolume = true
     private let defaults = UserDefaults.standard
     private var lastVolumeSent = Date.distantPast
     private var connectTask: Task<Void, Never>?
@@ -114,16 +122,16 @@ final class TVController: ObservableObject {
     func connect() {
         connectTask?.cancel()
         connectTask = Task {
-            if client?.isConnected == true { return }
+            if isLive { return }
             status = .connecting
-            if !ip.isEmpty, await attempt(ip) {
+            if !ip.isEmpty, await attemptAny(ip) {
                 Task { await discover() }
                 return
             }
             status = .searching
             await discover()
             let preferred = devices.first { $0.ip == ip } ?? devices.first
-            if let target = preferred, await attempt(target.ip) {
+            if let target = preferred, await attemptAny(target.ip) {
                 ip = target.ip
                 if devices.count > 1 { show("Found \(devices.count) TVs · connected to \(target.name)") }
                 return
@@ -141,11 +149,12 @@ final class TVController: ObservableObject {
         let hosts = await Self.scanAll(prefix: prefix())
         var found: [TVDevice] = []
         for host in hosts {
-            let info = await Self.describe(host)
-            found.append(TVDevice(ip: host, name: info.name ?? "TV at \(host)", model: info.model))
+            guard let info = await TVDriver.identify(host) else { continue }
+            found.append(TVDevice(ip: host, name: info.1 ?? "TV at \(host)", model: info.2, brand: info.0))
+            defaults.set(info.0.rawValue, forKey: "brand_\(host)")
         }
         if let current = connectedIP, !found.contains(where: { $0.ip == current }) {
-            found.insert(TVDevice(ip: current, name: model, model: nil), at: 0)
+            found.insert(TVDevice(ip: current, name: model, model: nil, brand: brand(of: current)), at: 0)
         }
         withAnimation(.easeOut(duration: 0.25)) { devices = found.sorted { $0.ip.compare($1.ip, options: .numeric) == .orderedAscending } }
     }
@@ -165,6 +174,53 @@ final class TVController: ObservableObject {
     func disconnect() {
         client?.close()
         client = nil
+        driver?.close()
+        driver = nil
+    }
+
+    func brand(of host: String) -> TVBrand {
+        if let d = devices.first(where: { $0.ip == host }) { return d.brand }
+        return TVBrand(rawValue: defaults.string(forKey: "brand_\(host)") ?? "") ?? .hisense
+    }
+
+    private func attemptAny(_ host: String) async -> Bool {
+        let b = brand(of: host)
+        return b == .hisense ? await attempt(host) : await attemptDriver(host, b)
+    }
+
+    private func attemptDriver(_ host: String, _ brand: TVBrand) async -> Bool {
+        var ev = DriverEvents()
+        ev.connected = { [weak self] in self?.status = .connected; self?.connectedIP = host }
+        ev.disconnected = { [weak self] in
+            guard let self, self.driver?.ip == host else { return }
+            self.driver = nil
+            self.connectedIP = nil
+            self.status = .offline
+        }
+        ev.prompt = { [weak self] m in
+            self?.status = .pairing
+            self?.nowTitle = "Check your TV"
+            self?.nowSubtitle = m
+            self?.show(m)
+        }
+        ev.state = { [weak self] t, s in self?.nowTitle = t; self?.nowSubtitle = s }
+        ev.volume = { [weak self] v in withAnimation(.easeOut(duration: 0.25)) { self?.volume = Double(v) } }
+        ev.apps = { [weak self] a in if !a.isEmpty { self?.apps = Array(a.prefix(16)) } }
+        ev.sources = { [weak self] s in self?.sources = s }
+        ev.model = { [weak self] m in
+            self?.model = m.trimmingCharacters(in: .whitespaces)
+            self?.defaults.set(self?.model, forKey: "model")
+        }
+        guard let d = TVDriver.make(brand, ip: host, events: ev) else { return false }
+        client?.close()
+        client = nil
+        driver?.close()
+        driver = d
+        guard await d.connect() else { driver = nil; return false }
+        connectedIP = host
+        if status != .pairing { status = .connected }
+        canSetVolume = d.canSetVolume
+        return true
     }
 
     private func attempt(_ host: String) async -> Bool {
@@ -190,6 +246,9 @@ final class TVController: ObservableObject {
         }
         if ok {
             client = c
+            driver?.close()
+            driver = nil
+            canSetVolume = true
             connectedIP = host
             c.subscribe("/remoteapp/mobile/#")
             status = .connected
@@ -208,6 +267,7 @@ final class TVController: ObservableObject {
     }
 
     func refresh() {
+        if let d = driver { d.refresh(); return }
         action("ui_service", "gettvstate")
         action("ui_service", "capability")
         action("ui_service", "sourcelist")
@@ -226,7 +286,11 @@ final class TVController: ObservableObject {
         guard let prefix else { return [] }
         return await withTaskGroup(of: String?.self) { group in
             for i in 1..<255 {
-                group.addTask { await probe(prefix + String(i)) ? prefix + String(i) : nil }
+                group.addTask {
+                    let host = prefix + String(i)
+                    for port in TVDriver.ports where await TVDriver.tcpOpen(host, port, timeout: 1.0) { return host }
+                    return nil
+                }
             }
             var hits: [String] = []
             for await hit in group { if let hit { hits.append(hit) } }
@@ -310,11 +374,13 @@ final class TVController: ObservableObject {
 
     func key(_ k: String) {
         Haptics.tap()
+        if let d = driver { d.key(k); return }
         guard let c = client, c.isConnected else { notConnected(); return }
         c.publish("/remoteapp/tv/remote_service/\(clientId)/actions/sendkey", k)
     }
 
     func text(_ code: String) {
+        if let d = driver { d.text(code); return }
         guard let c = client, c.isConnected else { notConnected(); return }
         c.publish("/remoteapp/tv/remote_service/\(clientId)/actions/input", code)
     }
@@ -326,11 +392,13 @@ final class TVController: ObservableObject {
     func setVolume(_ v: Double, force: Bool = false) {
         guard force || Date().timeIntervalSince(lastVolumeSent) > 0.12 else { return }
         lastVolumeSent = Date()
+        if let d = driver { d.setVolume(Int(v)); return }
         action("platform_service", "changevolume", String(Int(v)))
     }
 
     func power() {
         Haptics.heavy()
+        if let d = driver, d.isConnected { d.key("KEY_POWER"); return }
         if client?.isConnected == true { key("KEY_POWER"); return }
         guard !mac.isEmpty, !ip.isEmpty else {
             show("Add the TV's MAC address in settings to turn it on")
@@ -365,6 +433,7 @@ final class TVController: ObservableObject {
 
     func choose(_ s: TVSource) {
         Haptics.tap()
+        if let d = driver { d.source(s); show("Switching to \(s.displayName)"); return }
         let payload = json(["sourceid": s.sourceId, "sourcename": s.sourceName])
         action("ui_service", "changesource", payload)
         show("Switching to \(s.displayName)")
@@ -372,6 +441,7 @@ final class TVController: ObservableObject {
 
     func launch(_ a: TVApp) {
         Haptics.tap()
+        if let d = driver { d.launch(a); show("Opening \(a.displayName)"); return }
         guard client?.isConnected == true else { notConnected(); return }
         let payload = json(["appId": a.appId, "name": a.name, "url": a.url, "urlType": a.urlType, "storeType": a.storeType])
         action("ui_service", "launchapp", payload)
