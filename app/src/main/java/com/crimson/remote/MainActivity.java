@@ -113,7 +113,10 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         if (i.getStringExtra("ip") != null) e.putString("ip", i.getStringExtra("ip"));
         if (i.getStringExtra("mac") != null) e.putString("mac", i.getStringExtra("mac"));
         if (i.getStringExtra("cid") != null) { cid = i.getStringExtra("cid"); e.putString("cid", cid); }
+        String bridgeExtra = i.getStringExtra("bridge");
         e.apply();
+        if ("on".equals(bridgeExtra)) { prefs.edit().putBoolean("bridge_on", true).apply(); BridgeService.start(this); }
+        if ("off".equals(bridgeExtra)) { prefs.edit().putBoolean("bridge_on", false).apply(); BridgeService.stop(this); }
     }
 
     @Override protected void onResume() {
@@ -522,6 +525,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         appsRow.setPadding(0, dp(this, 10), 0, dp(this, 4));
         hs.addView(appsRow);
         root.addView(hs);
+
+        root.addView(bridgeCard(), margins(-1, -2, 0, 24));
 
         TextView foot = text(this, "Crimson Remote", 11, FAINT, 400);
         foot.setGravity(Gravity.CENTER);
@@ -1000,11 +1005,34 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             tile.setPadding(dp(this, 6), dp(this, 6), dp(this, 6), dp(this, 6));
             tile.setBackground(ripple(shape(0, dp(this, 18), 0, this)));
 
-            TextView badge = text(this, name.substring(0, 1).toUpperCase(), 22, Color.WHITE, 700);
+            // Letter badge first; swapped for the real logo as soon as it loads.
+            final FrameLayout badgeBox = new FrameLayout(this);
+            final TextView badge = text(this, name.substring(0, 1).toUpperCase(), 22, Color.WHITE, 700);
             badge.setGravity(Gravity.CENTER);
             int c = tints[Math.abs(name.hashCode()) % tints.length];
-            badge.setBackground(gradient(c, darker(c), dp(this, 18)));
-            tile.addView(badge, new LinearLayout.LayoutParams(dp(this, 58), dp(this, 58)));
+            badgeBox.setBackground(gradient(c, darker(c), dp(this, 18)));
+            badgeBox.setClipToOutline(true);
+            badgeBox.addView(badge, new FrameLayout.LayoutParams(-1, -1));
+            final android.widget.ImageView logo = new android.widget.ImageView(this);
+            logo.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+            int pad = dp(this, 11);
+            logo.setPadding(pad, pad, pad, pad);
+            logo.setAlpha(0f);
+            badgeBox.addView(logo, new FrameLayout.LayoutParams(-1, -1));
+            tile.addView(badgeBox, new LinearLayout.LayoutParams(dp(this, 58), dp(this, 58)));
+            final String domain = AppIcons.domain(name, app.optString("url"));
+            if (domain != null) {
+                new Thread(() -> {
+                    final android.graphics.Bitmap bm = AppIcons.load(domain);
+                    if (bm == null) return;
+                    MAIN.post(() -> {
+                        logo.setImageBitmap(bm);
+                        badgeBox.setBackground(shape(Color.WHITE, dp(this, 18), 0, this));
+                        badge.animate().alpha(0f).setDuration(180).start();
+                        logo.animate().alpha(1f).setDuration(260).start();
+                    });
+                }).start();
+            }
             TextView label = text(this, name, 11, SUB, 500);
             label.setGravity(Gravity.CENTER);
             label.setMaxLines(1);
@@ -1018,6 +1046,89 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             tile.setTranslationY(dp(this, 10));
             tile.animate().alpha(1f).translationY(0).setStartDelay(i * 35L).setDuration(260).start();
         }
+    }
+
+    // ---------------------------------------------------------------- iPhone bridge
+
+    View bridgeCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(this, 18), dp(this, 16), dp(this, 18), dp(this, 16));
+        card.setBackground(shape(SURFACE, dp(this, 22), STROKE, this));
+        card.setLayoutTransition(new LayoutTransition());
+
+        LinearLayout top = row();
+        LinearLayout txt = new LinearLayout(this);
+        txt.setOrientation(LinearLayout.VERTICAL);
+        TextView label = text(this, "IPHONE BRIDGE", 10, CRIMSON, 700);
+        label.setLetterSpacing(0.22f);
+        txt.addView(label);
+        TextView desc = text(this, "Use this remote from your iPhone or any browser on the same Wi-Fi.", 13, SUB, 400);
+        desc.setLineSpacing(0, 1.15f);
+        txt.addView(desc, margins(-1, -2, 0, 6));
+        top.addView(txt, new LinearLayout.LayoutParams(0, -2, 1));
+
+        final FrameLayout toggle = new FrameLayout(this);
+        final View knob = new View(this);
+        knob.setBackground(shape(Color.WHITE, dp(this, 11), 0, this));
+        knob.setElevation(dp(this, 2));
+        toggle.addView(knob, new FrameLayout.LayoutParams(dp(this, 22), dp(this, 22), Gravity.CENTER_VERTICAL));
+        toggle.setPadding(dp(this, 3), 0, dp(this, 3), 0);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(dp(this, 50), dp(this, 28));
+        tlp.leftMargin = dp(this, 12);
+        top.addView(toggle, tlp);
+        card.addView(top);
+
+        final LinearLayout on = new LinearLayout(this);
+        on.setOrientation(LinearLayout.VERTICAL);
+        final TextView addr = text(this, "", 17, TEXT, 700);
+        addr.setTextIsSelectable(true);
+        on.addView(addr, margins(-1, -2, 0, 14));
+        TextView how = text(this, "On the iPhone, open this in Safari, tap Share, then Add to Home Screen.", 12, FAINT, 400);
+        how.setLineSpacing(0, 1.15f);
+        on.addView(how, margins(-1, -2, 0, 6));
+        LinearLayout btns = row();
+        TextView copy = chip("Copy link");
+        press(copy, () -> {
+            String a = Bridge.address();
+            if (a == null) { toast("Connect the phone to Wi-Fi first"); return; }
+            ((android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
+                    .setPrimaryClip(android.content.ClipData.newPlainText("Crimson", a));
+            toast("Link copied");
+        }, false);
+        btns.addView(copy, chipLp(1));
+        TextView share = chip("Share");
+        press(share, () -> {
+            String a = Bridge.address();
+            if (a == null) { toast("Connect the phone to Wi-Fi first"); return; }
+            Intent s = new Intent(Intent.ACTION_SEND);
+            s.setType("text/plain");
+            s.putExtra(Intent.EXTRA_TEXT, "Crimson Remote: " + a);
+            startActivity(Intent.createChooser(s, "Send the remote link"));
+        }, false);
+        btns.addView(share, chipLp(1));
+        on.addView(btns, margins(-1, -2, 0, 12));
+        card.addView(on);
+
+        final Runnable paint = () -> {
+            boolean enabled = prefs.getBoolean("bridge_on", false);
+            toggle.setBackground(enabled ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 14)) : shape(SURFACE2, dp(this, 14), STROKE, this));
+            knob.animate().translationX(enabled ? dp(this, 22) : 0).setDuration(240)
+                    .setInterpolator(new android.view.animation.OvershootInterpolator(2f)).start();
+            on.setVisibility(enabled ? View.VISIBLE : View.GONE);
+            String a = Bridge.address();
+            addr.setText(a == null ? "Connect the phone to Wi-Fi" : a);
+        };
+        press(toggle, () -> {
+            boolean enabled = !prefs.getBoolean("bridge_on", false);
+            prefs.edit().putBoolean("bridge_on", enabled).apply();
+            if (enabled) BridgeService.start(this); else BridgeService.stop(this);
+            buzz(this, 15);
+            paint.run();
+        }, false);
+        paint.run();
+        if (prefs.getBoolean("bridge_on", false) && !BridgeService.running) BridgeService.start(this);
+        return card;
     }
 
     // ================================================================ helpers

@@ -1,12 +1,33 @@
 # Crimson Remote
 
-A fast, good-looking Android remote for Hisense VIDAA smart TVs, built by **crimson**.
+A fast, good-looking Android and iPhone remote for Hisense VIDAA smart TVs, built by **crimson**.
 
 <p>
   <img src="screenshots/remote.png" width="240" alt="Remote">
   <img src="screenshots/touchpad.png" width="240" alt="Touchpad">
   <img src="screenshots/keyboard.png" width="240" alt="Keyboard">
 </p>
+
+## Download & install
+
+**[⬇ Get the latest version](../../releases/latest)** — open the latest release and download the file for your phone.
+
+### Android (`CrimsonRemote.apk`)
+1. On the phone, open the latest release and tap **CrimsonRemote.apk**.
+2. When asked, allow your browser to **install unknown apps**, then tap **Install**.
+3. Open **Crimson Remote**. It finds the TV by itself; type the 4-digit code the TV shows the first time.
+
+### iPhone (`Crimson.ipa`)
+iPhone apps outside the App Store are installed with **SideStore** (free, uses your Apple ID).
+1. Install SideStore once by following the guide at [sidestore.io](https://sidestore.io).
+2. On the iPhone, open the latest release in Safari and download **Crimson.ipa** (it saves to Files).
+3. In Files, tap and hold **Crimson.ipa** → **Share** → **SideStore** (or in SideStore tap **+** and pick the file).
+4. Open **Crimson**, tap **Allow** when it asks to find devices on your network, then type the TV's 4-digit code.
+5. Open SideStore about once a week and tap **Refresh** so the app keeps opening.
+
+### Use it from an iPhone without installing (Android bridge)
+In the Android app, turn on **iPhone bridge**. Any phone or laptop on the same Wi-Fi can then open the
+link it shows (like `http://192.168.1.10:8787`) and use the remote in the browser.
 
 ## Features
 

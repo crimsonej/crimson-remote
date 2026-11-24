@@ -11,7 +11,9 @@ OUT=build
 rm -rf "$OUT"; mkdir -p "$OUT/classes" "$OUT/dex"
 
 "$BT/aapt2" compile --dir "$SRC/res" -o "$OUT/res.zip"
-"$BT/aapt2" link -o "$OUT/base.apk" -I "$JAR" --manifest "$SRC/AndroidManifest.xml" "$OUT/res.zip" --java "$OUT/gen" --auto-add-overlay
+# The web app (web/) is bundled so the phone can serve it to an iPhone.
+mkdir -p "$OUT/assets/web" && cp -r web/. "$OUT/assets/web/"
+"$BT/aapt2" link -o "$OUT/base.apk" -I "$JAR" --manifest "$SRC/AndroidManifest.xml" "$OUT/res.zip" -A "$OUT/assets" --java "$OUT/gen" --auto-add-overlay
 javac --release 11 -nowarn -cp "$JAR" -d "$OUT/classes" $(find "$SRC/java" "$OUT/gen" -name '*.java')
 "$BT/d8" --min-api 24 --lib "$JAR" --output "$OUT/dex" $(find "$OUT/classes" -name '*.class')
 cp "$OUT/base.apk" "$OUT/unsigned.apk"
