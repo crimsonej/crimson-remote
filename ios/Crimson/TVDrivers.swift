@@ -138,7 +138,9 @@ class TVDriver {
             let mac = tag(xml, "network-type") == "ethernet" ? tag(xml, "ethernet-mac") : tag(xml, "wifi-mac")
             return (.roku, tag(xml, "user-device-name") ?? tag(xml, "friendly-device-name") ?? "Roku", tag(xml, "model-name"), mac)
         }
-        if await tcpOpen(host, 8001) || (await tcpOpen(host, 8002)) {
+        let samsungPort = await tcpOpen(host, 8001)
+        let samsungSecure = samsungPort ? true : await tcpOpen(host, 8002)
+        if samsungPort || samsungSecure {
             if let js = await fetch("http://\(host):8001/api/v2/"),
                let o = try? JSONSerialization.jsonObject(with: Data(js.utf8)) as? [String: Any],
                let d = o["device"] as? [String: Any] {
@@ -146,7 +148,9 @@ class TVDriver {
                 return (.samsung, name, d["modelName"] as? String, d["wifiMac"] as? String)
             }
         }
-        if await tcpOpen(host, 3000) || (await tcpOpen(host, 3001)) { return (.lg, "LG TV", nil, nil) }
+        let lgPort = await tcpOpen(host, 3000)
+        let lgSecure = lgPort ? true : await tcpOpen(host, 3001)
+        if lgPort || lgSecure { return (.lg, "LG TV", nil, nil) }
         return nil
     }
 }
