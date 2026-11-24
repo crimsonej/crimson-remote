@@ -39,6 +39,8 @@ struct ContentView: View {
                         }
                     }
                     .padding(.top, 18)
+                    .opacity(tv.status == .connected ? 1 : 0.45)
+                    .animation(.easeInOut(duration: 0.25), value: tv.status)
 
                     AppsRow().padding(.top, 24)
 
@@ -83,6 +85,9 @@ struct ContentView: View {
         }
         .onChange(of: phase) { p in
             if p == .active { tv.connect() } else if p == .background { tv.disconnect() }
+        }
+        .onChange(of: tv.chooseTV) { choose in
+            if choose { sheet = .devices; tv.chooseTV = false }
         }
         .onChange(of: tv.showPairing) { show in
             if show { sheet = .pairing } else if sheet == .pairing { sheet = nil }
@@ -155,7 +160,7 @@ struct ContentView: View {
                 .buttonStyle(PressStyle())
                 .accessibilityLabel("Settings")
             }
-            StatusPill(onTap: { if tv.status == .offline { tv.connect() } else { sheet = .devices } })
+            ConnectionCard(openTVs: { sheet = .devices }, openSettings: { sheet = .settings })
         }
     }
 }
@@ -200,47 +205,104 @@ struct SplashView: View {
     }
 }
 
-struct StatusPill: View {
+/// What the connection is doing right now, with only the buttons that make sense.
+struct ConnectionCard: View {
     @EnvironmentObject var tv: TVController
-    var onTap: () -> Void
+    var openTVs: () -> Void
+    var openSettings: () -> Void
     @State private var breathe = false
 
     var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 8) {
-                Circle().fill(color).frame(width: 8, height: 8)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Circle().fill(color).frame(width: 10, height: 10)
                     .opacity(busy && breathe ? 0.25 : 1)
                     .animation(busy ? .easeInOut(duration: 0.7).repeatForever() : .default, value: breathe)
-                Text(label)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Theme.sub)
-                    .contentTransition(.opacity)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(head).font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.text)
+                        .contentTransition(.opacity)
+                    if !detail.isEmpty {
+                        Text(detail).font(.system(size: 12)).foregroundStyle(Theme.sub).lineLimit(2)
+                    }
+                }
+                Spacer(minLength: 0)
             }
-            .padding(.leading, 10).padding(.trailing, 12).padding(.vertical, 7)
-            .card(radius: 16)
+            HStack(spacing: 8) {
+                ForEach(buttons, id: \.0) { b in
+                    Button { Haptics.tap(); b.2() } label: {
+                        Text(b.0).font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(b.1 ? Color.white : Theme.text)
+                            .frame(maxWidth: .infinity).frame(height: 38)
+                            .background(Capsule().fill(b.1 ? AnyShapeStyle(Theme.crimsonGradient) : AnyShapeStyle(Theme.surface2)))
+                            .overlay(Capsule().stroke(b.1 ? Color.clear : Theme.stroke))
+                    }
+                    .buttonStyle(PressStyle(scale: 0.95))
+                }
+            }
         }
-        .buttonStyle(PressStyle(scale: 0.96))
+        .padding(14)
+        .card(radius: 18)
         .animation(.easeInOut(duration: 0.25), value: tv.status)
         .onAppear { breathe = true }
     }
 
-    private var busy: Bool { tv.status == .connecting || tv.status == .searching || tv.status == .pairing }
+    private var busy: Bool { [.connecting, .searching, .pairing, .waking].contains(tv.status) }
     private var color: Color {
         switch tv.status {
         case .connected: return Theme.green
-        case .offline: return Theme.red
+        case .offline, .none: return Theme.red
+        case .disconnected, .idle: return Theme.faint
         default: return Theme.amber
         }
     }
-    private var label: String {
+    private var name: String { tv.current?.title ?? "the TV" }
+    private var head: String {
         switch tv.status {
-        case .connecting: return "Connecting"
-        case .searching: return "Looking for TVs"
-        case .connected:
-            if let ip = tv.connectedIP { return "Connected · \(ip)" }
-            return "Connected"
-        case .offline: return "TV not found · tap to retry"
-        case .pairing: return "Pairing"
+        case .idle: return tv.current == nil ? "No TV yet" : "Ready to connect"
+        case .searching: return "Looking for TVs on this Wi-Fi"
+        case .connecting: return "Connecting to \(name)"
+        case .connected: return "Connected"
+        case .offline: return "\(name) isn't answering"
+        case .pairing: return "Waiting for the TV"
+        case .disconnected: return "Disconnected"
+        case .none: return "No TVs found"
+        case .choose: return "\(tv.devices.count) TVs found"
+        case .waking: return "Turning on \(name)"
+        }
+    }
+    private var detail: String {
+        switch tv.status {
+        case .connected: return [tv.current?.brand.label, tv.connectedIP].compactMap { $0 }.joined(separator: " · ")
+        case .connecting: return tv.current?.ip ?? ""
+        case .searching: return "This takes a few seconds"
+        case .offline: return tv.current?.canWake == true ? "It may be off. Tap Turn on." : "It may be off, or on another Wi-Fi"
+        case .pairing: return tv.statusNote ?? "Approve Crimson on the TV"
+        case .disconnected: return "Tap Connect when you want to use the TV"
+        case .none: return "Turn a TV on and keep this iPhone on the same Wi-Fi"
+        case .choose: return "Choose which one to use"
+        case .waking: return "Sent the wake-up signal"
+        case .idle: return tv.current == nil ? "Find a TV on this Wi-Fi" : ""
+        }
+    }
+    private var buttons: [(String, Bool, () -> Void)] {
+        let canWake = tv.current?.canWake == true
+        switch tv.status {
+        case .connected: return [("Disconnect", false, tv.disconnectNow), ("Switch TV", false, openTVs)]
+        case .connecting, .searching, .waking: return [("Stop", false, tv.disconnectNow)]
+        case .pairing: return [("Stop", false, tv.disconnectNow), ("Try again", true, tv.reconnect)]
+        case .offline:
+            var b: [(String, Bool, () -> Void)] = []
+            if canWake { b.append(("Turn on", true, tv.wake)) }
+            b.append(("Reconnect", !canWake, tv.reconnect))
+            b.append(("Switch TV", false, openTVs))
+            return b
+        case .choose: return [("Choose TV", true, openTVs), ("Search again", false, tv.reconnect)]
+        case .none: return [("Search again", true, tv.reconnect), ("Add by address", false, openSettings)]
+        case .disconnected, .idle:
+            var b: [(String, Bool, () -> Void)] = [("Connect", true, tv.reconnect)]
+            if canWake { b.append(("Turn on", false, tv.wake)) }
+            b.append(("Switch TV", false, openTVs))
+            return b
         }
     }
 }
@@ -349,6 +411,11 @@ struct AppsRow: View {
                 .font(.system(size: 11, weight: .semibold))
                 .tracking(2)
                 .foregroundStyle(Theme.faint)
+            if tv.apps.isEmpty {
+                Text("Your TV's apps show here once it's connected.")
+                    .font(.system(size: 13)).foregroundStyle(Theme.faint)
+                    .padding(.vertical, 8)
+            }
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
                     ForEach(Array(tv.apps.enumerated()), id: \.element.id) { i, app in

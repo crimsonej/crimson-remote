@@ -7,8 +7,7 @@ struct SettingsView: View {
     @AppStorage("appearance") private var appearance = Appearance.system.rawValue
     @AppStorage("accent") private var accent = Accent.crimson.rawValue
     @AppStorage("haptics") private var haptics = true
-    @State private var ip = ""
-    @State private var mac = ""
+    @State private var address = ""
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -31,27 +30,36 @@ struct SettingsView: View {
                             icon("tv", Theme.crimson)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(tv.displayName).font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
-                                Text(tv.connectedIP.map { "Connected · \($0)" } ?? "Not connected")
+                                Text(tv.status == .connected ? "Connected · \(tv.connectedIP ?? "")" : "Not connected")
                                     .font(.system(size: 12)).foregroundStyle(Theme.sub)
                             }
                             Spacer()
-                            Text("\(tv.devices.count) found").font(.system(size: 12)).foregroundStyle(Theme.faint)
+                            Text("\(tv.saved.count) saved").font(.system(size: 12)).foregroundStyle(Theme.faint)
                             Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.faint)
                         }
                         .padding(14)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(PressStyle(scale: 0.98))
+                    if let cur = tv.current {
+                        divider
+                        Text("Saved: \(cur.brand.label) · \(cur.ip) · " + (cur.canWake ? "MAC \(cur.mac)" : "MAC not known yet"))
+                            .font(.system(size: 12)).foregroundStyle(Theme.sub)
+                            .padding(.horizontal, 14).padding(.vertical, 10)
+                    }
                     divider
-                    field("TV address (found automatically)", text: $ip, keyboard: .decimalPad)
-                    divider
-                    field("TV MAC address, for power-on", text: $mac, keyboard: .asciiCapable)
+                    Text("Add a TV by address (only if it isn't found automatically)")
+                        .font(.system(size: 12)).foregroundStyle(Theme.faint)
+                        .padding(.horizontal, 14).padding(.top, 10)
+                    field("e.g. 192.168.1.20", text: $address, keyboard: .decimalPad)
                     Button {
                         Haptics.tap()
-                        tv.saveSettings(ip: ip, mac: mac)
-                        tv.show("Saved")
+                        let a = address.trimmingCharacters(in: .whitespaces)
+                        guard a.split(separator: ".").count == 4 else { tv.show("Type an address like 192.168.1.20"); return }
+                        tv.add(address: a)
+                        dismiss()
                     } label: {
-                        Text("Save TV details").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
+                        Text("Add and connect").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
                             .frame(maxWidth: .infinity).frame(height: 44)
                             .background(Capsule().fill(Theme.crimsonGradient))
                     }
@@ -131,7 +139,7 @@ struct SettingsView: View {
             }
             .padding(22)
         }
-        .onAppear { ip = tv.ip; mac = tv.mac }
+
     }
 
     private var divider: some View { Rectangle().fill(Theme.stroke).frame(height: 1).padding(.leading, 14) }
@@ -165,13 +173,14 @@ struct DevicesView: View {
     @EnvironmentObject var tv: TVController
     @Environment(\.dismiss) private var dismiss
     @State private var spin = false
+    @State private var forgetting: SavedTV?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("TVs").font(.system(size: 26, weight: .heavy)).foregroundStyle(Theme.text)
-                    Text(tv.scanning ? "Searching this Wi-Fi…" : "\(tv.devices.count) found on this Wi-Fi")
+                    Text(tv.scanning ? "Searching this Wi-Fi…" : "\(tv.devices.count) found on this Wi-Fi right now")
                         .font(.system(size: 13)).foregroundStyle(Theme.sub)
                         .contentTransition(.opacity)
                 }
@@ -193,48 +202,95 @@ struct DevicesView: View {
                 .onChange(of: tv.scanning) { s in spin = s }
             }
 
-            if tv.devices.isEmpty && !tv.scanning {
-                VStack(spacing: 10) {
-                    Image(systemName: "tv.slash").font(.system(size: 34)).foregroundStyle(Theme.faint)
-                    Text("No TVs found").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
-                    Text("Turn the TV on and keep this iPhone on the same Wi-Fi, then tap refresh.")
-                        .font(.system(size: 13)).foregroundStyle(Theme.sub).multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity).padding(.vertical, 30)
-            }
-
             ScrollView(showsIndicators: false) {
-                VStack(spacing: 10) {
-                    ForEach(tv.devices) { d in
-                        let connected = d.ip == tv.connectedIP
-                        Button { tv.select(d); if !connected { dismiss() } } label: {
-                            HStack(spacing: 14) {
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                    .fill(connected ? AnyShapeStyle(Theme.crimsonGradient) : AnyShapeStyle(Theme.surface2))
-                                    .frame(width: 46, height: 46)
-                                    .overlay(Image(systemName: "tv.fill").foregroundStyle(connected ? Color.white : Theme.sub))
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(d.name).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
-                                    Text([d.model, d.ip].compactMap { $0 }.joined(separator: " · "))
-                                        .font(.system(size: 12)).foregroundStyle(Theme.sub)
-                                }
-                                Spacer()
-                                Text(connected ? "Connected" : "Connect")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(connected ? Theme.green : Theme.crimson)
-                                    .padding(.horizontal, 10).padding(.vertical, 6)
-                                    .background(Capsule().fill((connected ? Theme.green : Theme.crimson).opacity(0.12)))
-                            }
-                            .padding(12)
-                            .card(radius: 18)
+                VStack(alignment: .leading, spacing: 10) {
+                    if !tv.saved.isEmpty {
+                        label("YOUR TVS")
+                        ForEach(tv.saved) { saved in
+                            let here = found(for: saved)
+                            let isCurrent = saved.id == tv.currentID
+                            let connected = isCurrent && tv.status == .connected
+                            row(name: saved.title,
+                                sub: saved.brand.label + (saved.model.isEmpty ? "" : " · \(saved.model)") + (saved.canWake ? "" : " · can't be turned on yet"),
+                                state: connected ? "Connected" : here != nil ? "On · \(here!.ip)" : tv.scanning ? "Checking…" : "Not found",
+                                connected: connected,
+                                tap: {
+                                    if let here { tv.select(here) } else { tv.select(saved: saved) }
+                                    if !connected { dismiss() }
+                                },
+                                forget: { forgetting = saved })
                         }
-                        .buttonStyle(PressStyle(scale: 0.98))
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    }
+                    let fresh = tv.devices.filter { d in !tv.saved.contains { s in (!s.mac.isEmpty && s.mac == d.mac) || (s.mac.isEmpty && s.ip == d.ip) } }
+                    if !fresh.isEmpty {
+                        label(tv.saved.isEmpty ? "FOUND ON THIS WI-FI" : "OTHER TVS FOUND").padding(.top, 6)
+                        ForEach(fresh) { d in
+                            row(name: d.name, sub: [d.brand.label, d.model, d.ip].compactMap { $0 }.joined(separator: " · "),
+                                state: "Connect", connected: false,
+                                tap: { tv.select(d); dismiss() }, forget: nil)
+                        }
+                    }
+                    if tv.saved.isEmpty && fresh.isEmpty && !tv.scanning {
+                        VStack(spacing: 10) {
+                            Image(systemName: "tv.slash").font(.system(size: 34)).foregroundStyle(Theme.faint)
+                            Text("No TVs found").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
+                            Text("Turn the TV on and keep this iPhone on the same Wi-Fi, then tap refresh.")
+                                .font(.system(size: 13)).foregroundStyle(Theme.sub).multilineTextAlignment(.center)
+                        }
+                        .frame(maxWidth: .infinity).padding(.vertical, 30)
                     }
                 }
             }
         }
         .padding(22)
-        .task { if tv.devices.isEmpty { await tv.discover() } }
+        .task { if tv.devices.isEmpty && !tv.scanning { await tv.discover() } }
+        .alert(item: $forgetting) { t in
+            Alert(title: Text("Forget \(t.title)?"),
+                  message: Text("Crimson removes its saved address, MAC and pairing. You can add it again by connecting."),
+                  primaryButton: .destructive(Text("Forget")) { tv.forget(t) },
+                  secondaryButton: .cancel())
+        }
+    }
+
+    private func found(for s: SavedTV) -> TVDevice? {
+        if !s.mac.isEmpty, let d = tv.devices.first(where: { $0.mac == s.mac }) { return d }
+        return s.mac.isEmpty ? tv.devices.first { $0.ip == s.ip } : nil
+    }
+
+    private func label(_ t: String) -> some View {
+        Text(t).font(.system(size: 11, weight: .bold)).tracking(1.6).foregroundStyle(Theme.faint).padding(.leading, 4)
+    }
+
+    private func row(name: String, sub: String, state: String, connected: Bool, tap: @escaping () -> Void, forget: (() -> Void)?) -> some View {
+        HStack(spacing: 12) {
+            Button(action: tap) {
+                HStack(spacing: 14) {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(connected ? AnyShapeStyle(Theme.crimsonGradient) : AnyShapeStyle(Theme.surface2))
+                        .frame(width: 46, height: 46)
+                        .overlay(Image(systemName: "tv.fill").foregroundStyle(connected ? Color.white : Theme.sub))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(name).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
+                        Text(sub).font(.system(size: 12)).foregroundStyle(Theme.sub).lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    let c = connected ? Theme.green : (state.hasPrefix("On") || state == "Connect") ? Theme.crimson : Theme.faint
+                    Text(state)
+                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(c)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Capsule().fill(c.opacity(0.12)))
+                }
+            }
+            .buttonStyle(PressStyle(scale: 0.98))
+            if let forget {
+                Button(action: forget) {
+                    Image(systemName: "xmark").font(.system(size: 12, weight: .bold)).foregroundStyle(Theme.faint)
+                        .frame(width: 30, height: 30)
+                }
+                .accessibilityLabel("Forget this TV")
+            }
+        }
+        .padding(12)
+        .card(radius: 18)
     }
 }

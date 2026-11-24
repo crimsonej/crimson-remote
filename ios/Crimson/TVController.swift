@@ -18,7 +18,7 @@ struct TVApp: Identifiable, Hashable {
             .replacingOccurrences(of: #"\s+\d+(\.\d+)*$"#, with: "", options: .regularExpression)
     }
 
-    /// Each service's own site icon stands in for its logo.
+    /// The TV's own icon when it gives one, otherwise each service's site icon.
     var logoURL: URL? {
         if let iconURL, !iconURL.isEmpty, let u = URL(string: iconURL) { return u }
         let n = displayName.lowercased()
@@ -39,13 +39,43 @@ struct TVApp: Identifiable, Hashable {
     }
 }
 
-/// A TV found on this Wi-Fi.
+/// A TV found on this Wi-Fi right now.
 struct TVDevice: Identifiable, Hashable {
     var id: String { ip }
     let ip: String
     var name: String
     var model: String?
     var brand: TVBrand = .hisense
+    var mac: String = ""
+}
+
+/// A TV this iPhone has connected to. Saved when the connection is made and
+/// recognised by its MAC, so it is found again when the router changes its address.
+struct SavedTV: Codable, Identifiable, Hashable {
+    var id: String
+    var ip: String
+    var name: String
+    var brand: TVBrand
+    var model: String
+    var mac: String
+    var lastSeen: Date
+
+    var canWake: Bool { mac.count == 17 }
+    var title: String { name.isEmpty ? "\(brand.label) TV" : name }
+
+    static func normalMac(_ raw: String?) -> String {
+        let hex = (raw ?? "").uppercased().filter { "0123456789ABCDEF".contains($0) }
+        guard hex.count == 12, hex != "000000000000" else { return "" }
+        var parts: [String] = []
+        var i = hex.startIndex
+        while i < hex.endIndex { let j = hex.index(i, offsetBy: 2); parts.append(String(hex[i..<j])); i = j }
+        return parts.joined(separator: ":")
+    }
+
+    static func idFor(mac: String, ip: String) -> String {
+        let m = normalMac(mac)
+        return m.isEmpty ? "ip:\(ip)" : m.replacingOccurrences(of: ":", with: "").lowercased()
+    }
 }
 
 struct TVSource: Identifiable, Hashable {
@@ -58,47 +88,40 @@ struct TVSource: Identifiable, Hashable {
 
 @MainActor
 final class TVController: ObservableObject {
-    enum Status: Equatable { case connecting, searching, connected, offline, pairing }
+    enum Status: Equatable {
+        case idle, searching, connecting, connected, offline, pairing, disconnected, none, choose, waking
+    }
 
-    @Published var status: Status = .connecting
-    @Published var model: String
-    @Published var nowTitle = "Connecting…"
+    @Published var status: Status = .idle
+    @Published var statusNote: String?
+    @Published var nowTitle = "Not connected"
     @Published var nowSubtitle = " "
     @Published var volume: Double = 0
-    @Published var apps: [TVApp] = TVController.defaultApps
+    @Published var apps: [TVApp] = []
     @Published var sources: [TVSource] = []
     @Published var showPairing = false
     @Published var pairingFailed = false
     @Published var toast: String?
     @Published var devices: [TVDevice] = []
+    @Published var saved: [SavedTV] = []
+    @Published var currentID: String?
     @Published var scanning = false
     @Published var connectedIP: String?
-
-    /// The connected TV's own name, or its model while the name is unknown.
-    var displayName: String {
-        if let ip = connectedIP ?? (ip.isEmpty ? nil : ip), let d = devices.first(where: { $0.ip == ip }), !d.name.hasPrefix("TV at") {
-            return d.name
-        }
-        return model
-    }
+    @Published var canSetVolume = true
+    @Published var chooseTV = false
 
     private var client: MQTTClient?
     /// The non-Hisense TV being controlled (Roku, Samsung, LG), if any.
     private var driver: TVDriver?
-    var isLive: Bool { client?.isConnected == true || driver?.isConnected == true }
-    @Published var canSetVolume = true
+    private var userDisconnected = false
     private let defaults = UserDefaults.standard
     private var lastVolumeSent = Date.distantPast
     private var connectTask: Task<Void, Never>?
 
-    var ip: String {
-        get { defaults.string(forKey: "ip") ?? "" }
-        set { defaults.set(newValue, forKey: "ip") }
-    }
-    var mac: String {
-        get { defaults.string(forKey: "mac") ?? "" }
-        set { defaults.set(newValue.uppercased(), forKey: "mac") }
-    }
+    var isLive: Bool { client?.isConnected == true || driver?.isConnected == true }
+    var current: SavedTV? { saved.first { $0.id == currentID } }
+    var displayName: String { current?.title ?? "No TV yet" }
+
     private var clientId: String {
         if let id = defaults.string(forKey: "cid") { return id }
         let id = "CrimsonIOS-" + UUID().uuidString.prefix(8).lowercased()
@@ -107,42 +130,171 @@ final class TVController: ObservableObject {
     }
 
     init() {
-        model = UserDefaults.standard.string(forKey: "model") ?? "Your TV"
+        if let d = defaults.data(forKey: "tvs"), let list = try? JSONDecoder().decode([SavedTV].self, from: d) { saved = list }
+        currentID = defaults.string(forKey: "current")
     }
 
-    static let defaultApps = [
-        TVApp(name: "YouTube", url: "youtube", appId: "3", urlType: 37, storeType: 0),
-        TVApp(name: "Netflix", url: "netflix", appId: "1", urlType: 37, storeType: 0),
-        TVApp(name: "Prime Video", url: "amazon", appId: "", urlType: 37, storeType: 0),
-    ]
+    // MARK: - Saved TVs
+
+    private func persist() {
+        if let d = try? JSONEncoder().encode(saved) { defaults.set(d, forKey: "tvs") }
+        defaults.set(currentID, forKey: "current")
+    }
+
+    /// Saves or updates a TV; an entry saved by address is merged once its MAC is known.
+    @discardableResult
+    func save(ip: String, name: String?, brand: TVBrand, model: String?, mac: String?, makeCurrent: Bool) -> SavedTV {
+        let m = SavedTV.normalMac(mac)
+        let newID = SavedTV.idFor(mac: m, ip: ip)
+        var tv = SavedTV(id: newID, ip: ip, name: name ?? "", brand: brand, model: model ?? "", mac: m, lastSeen: Date())
+        var oldIDs: [String] = []
+        saved.removeAll { old in
+            let same = old.id == newID || (!m.isEmpty && old.mac == m) || (old.id.hasPrefix("ip:") && old.ip == ip && old.brand == brand)
+            if same {
+                oldIDs.append(old.id)
+                if tv.mac.isEmpty { tv.mac = old.mac }
+                if tv.name.isEmpty { tv.name = old.name }
+                if tv.model.isEmpty { tv.model = old.model }
+            }
+            return same
+        }
+        tv.id = SavedTV.idFor(mac: tv.mac, ip: ip)
+        // Keep pairing tokens when an entry is re-keyed by its MAC.
+        for old in oldIDs where old != tv.id {
+            for k in ["samsung_token_", "lg_key_"] {
+                if let v = defaults.string(forKey: k + old), defaults.string(forKey: k + tv.id) == nil { defaults.set(v, forKey: k + tv.id) }
+            }
+        }
+        saved.append(tv)
+        if makeCurrent || currentID == nil || oldIDs.contains(currentID ?? "") { currentID = tv.id }
+        persist()
+        return tv
+    }
+
+    func forget(_ tv: SavedTV) {
+        if tv.id == currentID { disconnectNow() ; currentID = nil }
+        saved.removeAll { $0.id == tv.id }
+        defaults.removeObject(forKey: "samsung_token_\(tv.id)")
+        defaults.removeObject(forKey: "lg_key_\(tv.id)")
+        persist()
+        if current == nil { status = .idle; apps = []; sources = []; nowTitle = "Not connected"; nowSubtitle = " " }
+    }
 
     // MARK: - Connection
 
-    /// Connects to the chosen TV, or the first one found, and keeps the device list fresh.
+    /// Automatic connect (app opened). Does nothing after you pressed Disconnect.
     func connect() {
+        if userDisconnected { return }
+        if isLive { status = .connected; return }
         connectTask?.cancel()
         connectTask = Task {
-            if isLive { return }
-            status = .connecting
-            if !ip.isEmpty, await attemptAny(ip) {
-                Task { await discover() }
-                return
-            }
+            let cur = current
+            status = cur == nil ? .searching : .connecting
+            if let cur, await open(cur) { Task { await discover() }; return }
             status = .searching
             await discover()
-            let preferred = devices.first { $0.ip == ip } ?? devices.first
-            if let target = preferred, await attemptAny(target.ip) {
-                ip = target.ip
-                if devices.count > 1 { show("Found \(devices.count) TVs · connected to \(target.name)") }
+            if let cur {
+                if let d = findSaved(cur), await openFound(d) { return }
+                status = .offline
                 return
             }
-            status = .offline
-            nowTitle = "TV is off"
-            nowSubtitle = mac.isEmpty ? "Turn it on, and keep the iPhone on the same Wi-Fi" : "Tap power to wake it"
+            switch devices.count {
+            case 0: status = .none
+            case 1: if !(await openFound(devices[0])) { status = .offline }
+            default: status = .choose; chooseTV = true
+            }
         }
     }
 
-    /// Scans the Wi-Fi for every TV and looks up its name.
+    /// Connect / Reconnect button: start again from scratch.
+    func reconnect() {
+        userDisconnected = false
+        closeConnection()
+        connect()
+    }
+
+    /// Disconnect button: stays disconnected until you connect again.
+    func disconnectNow() {
+        userDisconnected = true
+        connectTask?.cancel()
+        closeConnection()
+        status = .disconnected
+        statusNote = nil
+    }
+
+    /// Closes the connection quietly (app sent to the background).
+    func disconnect() { closeConnection() }
+
+    private func closeConnection() {
+        client?.close()
+        client = nil
+        driver?.close()
+        driver = nil
+        connectedIP = nil
+    }
+
+    private func findSaved(_ tv: SavedTV) -> TVDevice? {
+        if !tv.mac.isEmpty, let d = devices.first(where: { $0.mac == tv.mac }) { return d }
+        return devices.first { $0.ip == tv.ip && $0.brand == tv.brand }
+    }
+
+    /// Saves a found TV and connects to it.
+    func openFound(_ d: TVDevice) async -> Bool {
+        let tv = save(ip: d.ip, name: d.name, brand: d.brand, model: d.model, mac: d.mac, makeCurrent: true)
+        return await open(tv)
+    }
+
+    private func open(_ tv: SavedTV) async -> Bool {
+        status = .connecting
+        return tv.brand == .hisense ? await attempt(tv.ip) : await attemptDriver(tv)
+    }
+
+    /// Switch to a TV that was just found.
+    func select(_ d: TVDevice) {
+        Haptics.tap()
+        userDisconnected = false
+        closeConnection()
+        nowTitle = "Connecting…"
+        nowSubtitle = d.name
+        connectTask?.cancel()
+        connectTask = Task { if !(await openFound(d)) { status = .offline } }
+    }
+
+    /// Switch to a saved TV, even if it wasn't found just now.
+    func select(saved tv: SavedTV) {
+        Haptics.tap()
+        currentID = tv.id
+        persist()
+        reconnect()
+    }
+
+    /// Adds a TV typed in by address.
+    func add(address: String) {
+        let host = address.trimmingCharacters(in: .whitespaces)
+        connectTask?.cancel()
+        connectTask = Task {
+            status = .connecting
+            guard let info = await TVDriver.identify(host) else {
+                status = .offline
+                show("No supported TV answered at \(host)")
+                return
+            }
+            userDisconnected = false
+            closeConnection()
+            let d = TVDevice(ip: host, name: info.1 ?? "\(info.0.label) TV", model: info.2, brand: info.0, mac: SavedTV.normalMac(info.3))
+            if !(await openFound(d)) { status = .offline }
+        }
+    }
+
+    /// Learns the TV's name, model and MAC after connecting and saves them.
+    private func learn(_ host: String) {
+        Task {
+            guard let info = await TVDriver.identify(host) else { return }
+            save(ip: host, name: info.1, brand: info.0, model: info.2, mac: info.3, makeCurrent: true)
+        }
+    }
+
+    /// Scans the Wi-Fi for every supported TV and reads its brand, name and MAC.
     func discover() async {
         scanning = true
         defer { scanning = false }
@@ -150,68 +302,48 @@ final class TVController: ObservableObject {
         var found: [TVDevice] = []
         for host in hosts {
             guard let info = await TVDriver.identify(host) else { continue }
-            found.append(TVDevice(ip: host, name: info.1 ?? "TV at \(host)", model: info.2, brand: info.0))
-            defaults.set(info.0.rawValue, forKey: "brand_\(host)")
+            let mac = SavedTV.normalMac(info.3)
+            found.append(TVDevice(ip: host, name: info.1 ?? "\(info.0.label) TV", model: info.2, brand: info.0, mac: mac))
+            // A saved TV that moved to a new address gets its address updated.
+            if !mac.isEmpty, let i = saved.firstIndex(where: { $0.mac == mac }), saved[i].ip != host {
+                saved[i].ip = host
+                persist()
+            }
         }
-        if let current = connectedIP, !found.contains(where: { $0.ip == current }) {
-            found.insert(TVDevice(ip: current, name: model, model: nil, brand: brand(of: current)), at: 0)
+        withAnimation(.easeOut(duration: 0.25)) {
+            devices = found.sorted { $0.ip.compare($1.ip, options: .numeric) == .orderedAscending }
         }
-        withAnimation(.easeOut(duration: 0.25)) { devices = found.sorted { $0.ip.compare($1.ip, options: .numeric) == .orderedAscending } }
     }
 
-    /// Switches to another TV from the list.
-    func select(_ device: TVDevice) {
-        Haptics.tap()
-        guard device.ip != connectedIP else { return }
-        ip = device.ip
-        disconnect()
-        connectedIP = nil
-        nowTitle = "Connecting…"
-        nowSubtitle = device.name
-        connect()
-    }
-
-    func disconnect() {
-        client?.close()
-        client = nil
-        driver?.close()
-        driver = nil
-    }
-
-    func brand(of host: String) -> TVBrand {
-        if let d = devices.first(where: { $0.ip == host }) { return d.brand }
-        return TVBrand(rawValue: defaults.string(forKey: "brand_\(host)") ?? "") ?? .hisense
-    }
-
-    private func attemptAny(_ host: String) async -> Bool {
-        let b = brand(of: host)
-        return b == .hisense ? await attempt(host) : await attemptDriver(host, b)
-    }
-
-    private func attemptDriver(_ host: String, _ brand: TVBrand) async -> Bool {
+    private func attemptDriver(_ tv: SavedTV) async -> Bool {
+        let host = tv.ip
         var ev = DriverEvents()
         ev.connected = { [weak self] in self?.status = .connected; self?.connectedIP = host }
         ev.disconnected = { [weak self] in
             guard let self, self.driver?.ip == host else { return }
             self.driver = nil
             self.connectedIP = nil
-            self.status = .offline
+            if !self.userDisconnected { self.status = .offline }
         }
         ev.prompt = { [weak self] m in
             self?.status = .pairing
+            self?.statusNote = m
             self?.nowTitle = "Check your TV"
             self?.nowSubtitle = m
-            self?.show(m)
         }
         ev.state = { [weak self] t, s in self?.nowTitle = t; self?.nowSubtitle = s }
         ev.volume = { [weak self] v in withAnimation(.easeOut(duration: 0.25)) { self?.volume = Double(v) } }
-        ev.apps = { [weak self] a in if !a.isEmpty { self?.apps = Array(a.prefix(16)) } }
+        ev.apps = { [weak self] a in self?.apps = Array(a.prefix(16)) }
         ev.sources = { [weak self] s in self?.sources = s }
         ev.model = { [weak self] m in
-            self?.model = m.trimmingCharacters(in: .whitespaces)
-            self?.defaults.set(self?.model, forKey: "model")
+            guard let self, let cur = self.current else { return }
+            self.save(ip: cur.ip, name: cur.name, brand: cur.brand, model: m.trimmingCharacters(in: .whitespaces), mac: cur.mac, makeCurrent: true)
         }
-        guard let d = TVDriver.make(brand, ip: host, events: ev) else { return false }
+        ev.mac = { [weak self] m in
+            guard let self, let cur = self.current else { return }
+            self.save(ip: cur.ip, name: cur.name, brand: cur.brand, model: cur.model, mac: m, makeCurrent: true)
+        }
+        guard let d = TVDriver.make(tv.brand, ip: host, id: tv.id, events: ev) else { return false }
         client?.close()
         client = nil
         driver?.close()
@@ -253,6 +385,7 @@ final class TVController: ObservableObject {
             c.subscribe("/remoteapp/mobile/#")
             status = .connected
             refresh()
+            learn(host)
         } else {
             c.close()
         }
@@ -263,7 +396,7 @@ final class TVController: ObservableObject {
         guard client === c else { return }
         client = nil
         connectedIP = nil
-        if status == .connected || status == .pairing { status = .offline }
+        if !userDisconnected && (status == .connected || status == .pairing) { status = .offline }
     }
 
     func refresh() {
@@ -276,12 +409,11 @@ final class TVController: ObservableObject {
     }
 
     private func prefix() -> String? {
-        if !ip.isEmpty, let dot = ip.lastIndex(of: ".") { return String(ip[...dot]) }
         guard let own = Self.wifiAddress(), let dot = own.lastIndex(of: ".") else { return nil }
         return String(own[...dot])
     }
 
-    /// Every address on this Wi-Fi that answers on the TV remote port.
+    /// Every address on this Wi-Fi that answers on a TV remote port.
     nonisolated static func scanAll(prefix: String?) async -> [String] {
         guard let prefix else { return [] }
         return await withTaskGroup(of: String?.self) { group in
@@ -295,60 +427,6 @@ final class TVController: ObservableObject {
             var hits: [String] = []
             for await hit in group { if let hit { hits.append(hit) } }
             return hits
-        }
-    }
-
-    /// Reads the TV's own name from its media-renderer description, when it has one.
-    nonisolated static func describe(_ host: String) async -> (name: String?, model: String?) {
-        guard let url = URL(string: "http://\(host):38400/MediaServer/rendererdevicedesc.xml") else { return (nil, nil) }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 2.5
-        guard let (data, _) = try? await URLSession.shared.data(for: req) else { return (nil, nil) }
-        let xml = String(decoding: data, as: UTF8.self)
-        func tag(_ t: String) -> String? {
-            guard let a = xml.range(of: "<\(t)>"), let b = xml.range(of: "</\(t)>", range: a.upperBound..<xml.endIndex) else { return nil }
-            let v = String(xml[a.upperBound..<b.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            return v.isEmpty ? nil : v
-        }
-        return (tag("friendlyName"), tag("modelName"))
-    }
-
-    /// Finds the TV by trying its remote-control port on every address of this Wi-Fi.
-    nonisolated static func scan(prefix: String?) async -> String? {
-        guard let prefix else { return nil }
-        return await withTaskGroup(of: String?.self) { group in
-            for i in 1..<255 {
-                group.addTask { await probe(prefix + String(i)) ? prefix + String(i) : nil }
-            }
-            for await hit in group {
-                if let hit { group.cancelAll(); return hit }
-            }
-            return nil
-        }
-    }
-
-    nonisolated private static func probe(_ host: String) async -> Bool {
-        await withCheckedContinuation { cont in
-            let q = DispatchQueue(label: "probe")
-            let conn = NWConnection(host: NWEndpoint.Host(host), port: 36669, using: .tcp)
-            var done = false
-            let finish: (Bool) -> Void = { ok in
-                q.async {
-                    if done { return }
-                    done = true
-                    conn.cancel()
-                    cont.resume(returning: ok)
-                }
-            }
-            conn.stateUpdateHandler = { state in
-                switch state {
-                case .ready: finish(true)
-                case .failed, .waiting: finish(false)
-                default: break
-                }
-            }
-            conn.start(queue: q)
-            q.asyncAfter(deadline: .now() + 1.2) { finish(false) }
         }
     }
 
@@ -400,34 +478,68 @@ final class TVController: ObservableObject {
         Haptics.heavy()
         if let d = driver, d.isConnected { d.key("KEY_POWER"); return }
         if client?.isConnected == true { key("KEY_POWER"); return }
-        guard !mac.isEmpty, !ip.isEmpty else {
-            show("Add the TV's MAC address in settings to turn it on")
-            return
-        }
-        wakeOnLan()
-        status = .connecting
-        show("Waking the TV…")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.connect() }
+        wake()
     }
 
-    /// Sends the wake-up packet straight to the TV's address.
-    private func wakeOnLan() {
-        let hex = mac.replacingOccurrences(of: ":", with: "").replacingOccurrences(of: "-", with: "")
-        guard hex.count == 12 else { return }
-        var macBytes = [UInt8]()
-        var idx = hex.startIndex
-        for _ in 0..<6 {
-            let next = hex.index(idx, offsetBy: 2)
-            macBytes.append(UInt8(hex[idx..<next], radix: 16) ?? 0)
-            idx = next
+    /// Sends the wake-up signal to the saved TV, then keeps trying to connect.
+    func wake() {
+        guard let tv = current else { show("Choose a TV first"); return }
+        guard tv.canWake else {
+            show("Connect to this TV once while it's on, then Crimson can turn it on")
+            return
         }
+        Haptics.heavy()
+        userDisconnected = false
+        status = .waking
+        connectTask?.cancel()
+        connectTask = Task {
+            await sendWake(tv)
+            for _ in 0..<10 {
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                if Task.isCancelled { return }
+                if await open(tv) { return }
+                // The TV may come back on a new address.
+                if let d = devices.first(where: { $0.mac == tv.mac }), d.ip != tv.ip, await openFound(d) { return }
+            }
+            if !isLive { status = .offline }
+        }
+    }
+
+    /// Wake-on-LAN. An iPhone app may not broadcast, so it sends the packet to the TV's
+    /// last address and also asks any Crimson bridge on the Wi-Fi (Android app or computer) to broadcast it.
+    private func sendWake(_ tv: SavedTV) async {
+        let hex = tv.mac.replacingOccurrences(of: ":", with: "")
+        var bytes = [UInt8]()
+        var i = hex.startIndex
+        while i < hex.endIndex { let j = hex.index(i, offsetBy: 2); bytes.append(UInt8(hex[i..<j], radix: 16) ?? 0); i = j }
         var packet = Data(repeating: 0xFF, count: 6)
-        for _ in 0..<16 { packet.append(contentsOf: macBytes) }
-        for port: UInt16 in [9, 7] {
-            let conn = NWConnection(host: NWEndpoint.Host(ip), port: NWEndpoint.Port(rawValue: port)!, using: .udp)
-            conn.start(queue: .global())
-            for _ in 0..<3 { conn.send(content: packet, completion: .contentProcessed { _ in }) }
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { conn.cancel() }
+        for _ in 0..<16 { packet.append(contentsOf: bytes) }
+        var targets = [tv.ip]
+        if let p = prefix() { targets.append(p + "255") }
+        for host in targets {
+            for port: UInt16 in [9, 7] {
+                let conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .udp)
+                conn.start(queue: .global())
+                for _ in 0..<3 { conn.send(content: packet, completion: .contentProcessed { _ in }) }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) { conn.cancel() }
+            }
+        }
+        // Ask Crimson bridges to broadcast it properly.
+        guard let p = prefix() else { return }
+        await withTaskGroup(of: Void.self) { group in
+            for n in 1..<255 {
+                group.addTask {
+                    let host = p + String(n)
+                    guard await TVDriver.tcpOpen(host, 8787, timeout: 0.6),
+                          let url = URL(string: "http://\(host):8787/api/wake") else { return }
+                    var r = URLRequest(url: url)
+                    r.httpMethod = "POST"
+                    r.timeoutInterval = 3
+                    r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    r.httpBody = try? JSONSerialization.data(withJSONObject: ["mac": tv.mac])
+                    _ = try? await URLSession.shared.data(for: r)
+                }
+            }
         }
     }
 
@@ -453,29 +565,22 @@ final class TVController: ObservableObject {
         action("ui_service", "authenticationcode", json(["authNum": code]))
     }
 
-    func saveSettings(ip newIp: String, mac newMac: String) {
-        ip = newIp.trimmingCharacters(in: .whitespaces)
-        mac = newMac.trimmingCharacters(in: .whitespaces)
-        disconnect()
-        connect()
-    }
-
     private var lastNotConnected = Date.distantPast
     private func notConnected() {
         guard Date().timeIntervalSince(lastNotConnected) > 2 else { return }
         lastNotConnected = Date()
-        show("Not connected to the TV")
+        show(status == .connecting || status == .searching ? "Still connecting…" : "Not connected. Use the buttons at the top to connect.")
     }
 
     func show(_ message: String) {
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { toast = message }
         let current = message
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
             if self?.toast == current { withAnimation(.easeOut(duration: 0.25)) { self?.toast = nil } }
         }
     }
 
-    // MARK: - Incoming
+    // MARK: - Incoming (Hisense)
 
     private func handle(topic: String, payload: String) {
         let obj = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any]
@@ -483,6 +588,7 @@ final class TVController: ObservableObject {
 
         if topic.hasSuffix("/data/authentication") {
             status = .pairing
+            statusNote = "Type the 4-digit code shown on the TV"
             showPairing = true
             action("ui_service", "vidaa_app_connect",
                    json(["app_version": 2, "connect_result": 0, "device_type": "Mobile App"]))
@@ -500,9 +606,8 @@ final class TVController: ObservableObject {
             if let obj { showState(obj) }
         } else if topic.hasSuffix("/data/capability"), let obj {
             let m = ((obj["devicemsg"] as? String) ?? "").split(separator: "_").first.map(String.init) ?? ""
-            if !m.isEmpty {
-                model = ((obj["vendorBrand"] as? String) == "his" ? "Hisense " : "") + m
-                defaults.set(model, forKey: "model")
+            if !m.isEmpty, let cur = current {
+                save(ip: cur.ip, name: cur.name, brand: cur.brand, model: m, mac: cur.mac, makeCurrent: true)
             }
         } else if topic.hasSuffix("/data/sourcelist"), let arr {
             sources = arr.map {
@@ -517,7 +622,7 @@ final class TVController: ObservableObject {
                 return TVApp(name: name, url: (a["url"] as? String) ?? "", appId: "\(a["appId"] ?? "")",
                              urlType: (a["urlType"] as? Int) ?? 37, storeType: (a["storeType"] as? Int) ?? 0)
             }
-            if !list.isEmpty { apps = Array(list.prefix(16)) }
+            apps = Array(list.prefix(16))
         } else if topic.contains("volumechange") || topic.hasSuffix("/data/volume") || topic.hasSuffix("/ui_service/volume") {
             if let v = obj?["volume_value"] as? Int {
                 withAnimation(.easeOut(duration: 0.25)) { volume = Double(v) }

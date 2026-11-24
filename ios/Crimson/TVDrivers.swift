@@ -25,18 +25,23 @@ struct DriverEvents {
     var apps: ([TVApp]) -> Void = { _ in }
     var sources: ([TVSource]) -> Void = { _ in }
     var model: (String) -> Void = { _ in }
+    /// The TV's MAC address, learned while connecting, so it can be turned on later.
+    var mac: (String) -> Void = { _ in }
 }
 
 /// Base class; keys use the app's common names (KEY_UP, KEY_OK …), text uses Lit_ codes.
 class TVDriver {
     let ip: String
+    /// The saved TV's id; pairing tokens are kept under it so they survive address changes.
+    let id: String
     var events: DriverEvents
     var isConnected: Bool { false }
     var canSetVolume: Bool { false }
     let defaults = UserDefaults.standard
 
-    init(ip: String, events: DriverEvents) {
+    init(ip: String, id: String, events: DriverEvents) {
         self.ip = ip
+        self.id = id
         self.events = events
     }
 
@@ -49,11 +54,11 @@ class TVDriver {
     func source(_ s: TVSource) {}
     func refresh() {}
 
-    static func make(_ brand: TVBrand, ip: String, events: DriverEvents) -> TVDriver? {
+    static func make(_ brand: TVBrand, ip: String, id: String, events: DriverEvents) -> TVDriver? {
         switch brand {
-        case .roku: return RokuDriver(ip: ip, events: events)
-        case .samsung: return SamsungDriver(ip: ip, events: events)
-        case .lg: return LGDriver(ip: ip, events: events)
+        case .roku: return RokuDriver(ip: ip, id: id, events: events)
+        case .samsung: return SamsungDriver(ip: ip, id: id, events: events)
+        case .lg: return LGDriver(ip: ip, id: id, events: events)
         case .hisense: return nil
         }
     }
@@ -111,24 +116,37 @@ class TVDriver {
         return v.isEmpty ? nil : v
     }
 
-    /// Brand, name and model of a host, or nil if it isn't a TV Crimson knows.
-    static func identify(_ host: String) async -> (TVBrand, String?, String?)? {
+    /// "key=value" lines, as in Hisense's modelDescription.
+    static func field(_ text: String?, _ key: String) -> String? {
+        guard let text else { return nil }
+        for line in text.components(separatedBy: .newlines) {
+            let l = line.trimmingCharacters(in: .whitespaces)
+            if l.hasPrefix(key + "=") { return String(l.dropFirst(key.count + 1)) }
+        }
+        return nil
+    }
+
+    /// Brand, name, model and MAC of a host, or nil if it isn't a TV Crimson knows.
+    static func identify(_ host: String) async -> (TVBrand, String?, String?, String?)? {
         if await tcpOpen(host, 36669) {
             let xml = await fetch("http://\(host):38400/MediaServer/rendererdevicedesc.xml")
-            return (.hisense, tag(xml, "friendlyName"), tag(xml, "modelName"))
+            let desc = tag(xml, "modelDescription")
+            let model = field(desc, "model_name").map { String($0.split(separator: "_").first ?? "") }
+            return (.hisense, tag(xml, "friendlyName"), model, field(desc, "mac"))
         }
         if await tcpOpen(host, 8060), let xml = await fetch("http://\(host):8060/query/device-info"), xml.contains("<device-info") {
-            return (.roku, tag(xml, "user-device-name") ?? tag(xml, "friendly-device-name") ?? "Roku", tag(xml, "model-name"))
+            let mac = tag(xml, "network-type") == "ethernet" ? tag(xml, "ethernet-mac") : tag(xml, "wifi-mac")
+            return (.roku, tag(xml, "user-device-name") ?? tag(xml, "friendly-device-name") ?? "Roku", tag(xml, "model-name"), mac)
         }
         if await tcpOpen(host, 8001) || (await tcpOpen(host, 8002)) {
             if let js = await fetch("http://\(host):8001/api/v2/"),
                let o = try? JSONSerialization.jsonObject(with: Data(js.utf8)) as? [String: Any],
                let d = o["device"] as? [String: Any] {
                 let name = ((d["name"] as? String) ?? "Samsung TV").replacingOccurrences(of: "[TV] ", with: "")
-                return (.samsung, name, d["modelName"] as? String)
+                return (.samsung, name, d["modelName"] as? String, d["wifiMac"] as? String)
             }
         }
-        if await tcpOpen(host, 3000) || (await tcpOpen(host, 3001)) { return (.lg, "LG TV", nil) }
+        if await tcpOpen(host, 3000) || (await tcpOpen(host, 3001)) { return (.lg, "LG TV", nil, nil) }
         return nil
     }
 }
@@ -242,8 +260,10 @@ final class RokuDriver: TVDriver {
         up = true
         let model = TVDriver.tag(info, "model-name") ?? ""
         let name = TVDriver.tag(info, "user-device-name")
+        let mac = TVDriver.tag(info, "network-type") == "ethernet" ? TVDriver.tag(info, "ethernet-mac") : TVDriver.tag(info, "wifi-mac")
         main {
             self.events.model("Roku \(model)")
+            if let mac { self.events.mac(mac) }
             self.events.connected()
             if let name { self.events.state(name, "Roku") }
             if TVDriver.tag(info, "is-tv") == "true" {
@@ -331,7 +351,7 @@ final class RokuDriver: TVDriver {
 final class SamsungDriver: TVDriver {
     private let ws = TVSocket()
     override var isConnected: Bool { ws.isOpen }
-    private var tokenKey: String { "samsung_token_\(ip)" }
+    private var tokenKey: String { "samsung_token_\(id)" }
 
     static let keys: [String: String] = [
         "KEY_OK": "KEY_ENTER", "KEY_RETURNS": "KEY_RETURN", "KEY_VOLUMEUP": "KEY_VOLUP", "KEY_VOLUMEDOWN": "KEY_VOLDOWN",
@@ -352,9 +372,7 @@ final class SamsungDriver: TVDriver {
             if let js = await TVDriver.fetch("http://\(ip):8001/api/v2/"), let d = jsonObject(js)?["device"] as? [String: Any] {
                 let model = d["modelName"] as? String ?? ""
                 main { self.events.model("Samsung \(model)") }
-                if let mac = d["wifiMac"] as? String, (defaults.string(forKey: "mac") ?? "").isEmpty {
-                    defaults.set(mac.uppercased(), forKey: "mac")
-                }
+                if let mac = d["wifiMac"] as? String { main { self.events.mac(mac) } }
             }
             return true
         }
@@ -424,7 +442,7 @@ final class LGDriver: TVDriver {
     private let lock = NSLock()
     override var isConnected: Bool { ws.isOpen }
     override var canSetVolume: Bool { true }
-    private var keyName: String { "lg_key_\(ip)" }
+    private var keyName: String { "lg_key_\(id)" }
 
     static let buttons: [String: String] = {
         var m = ["KEY_UP": "UP", "KEY_DOWN": "DOWN", "KEY_LEFT": "LEFT", "KEY_RIGHT": "RIGHT", "KEY_OK": "ENTER",
@@ -510,6 +528,10 @@ final class LGDriver: TVDriver {
         case "info":
             let model = p["modelName"] as? String ?? ""
             main { self.events.model("LG \(model)") }
+        case "net":
+            let wired = p["wiredInfo"] as? [String: Any], wifi = p["wifiInfo"] as? [String: Any]
+            let mac = (wired?["state"] as? String) == "connected" ? wired?["macAddress"] as? String : wifi?["macAddress"] as? String
+            if let mac, !mac.isEmpty { main { self.events.mac(mac) } }
         case "pointer":
             if let path = p["socketPath"] as? String, let url = URL(string: path) {
                 Task { _ = await self.pointer.connect(url) }
@@ -521,6 +543,7 @@ final class LGDriver: TVDriver {
     private func afterRegister() {
         request("ssap://com.webos.service.networkinput/getPointerInputSocket", tag: "pointer")
         request("ssap://system/getSystemInfo", tag: "info")
+        request("ssap://com.webos.service.connectionmanager/getinfo", tag: "net")
         request("ssap://audio/getVolume", tag: "volume", subscribe: true)
         request("ssap://com.webos.applicationManager/getForegroundAppInfo", tag: "fg", subscribe: true)
         refresh()

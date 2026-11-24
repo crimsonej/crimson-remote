@@ -250,7 +250,7 @@ struct CastPanel: View {
     }
 
     private func send(_ item: PhotosPickerItem) async {
-        guard let ip = tv.connectedIP ?? (tv.ip.isEmpty ? nil : tv.ip) else {
+        guard let ip = tv.connectedIP ?? tv.current?.ip else {
             caster.status = "Connect to a TV first"
             return
         }
