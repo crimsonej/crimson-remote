@@ -3,3 +3,7 @@ build/
 *.keystore
 *.apk
 local.properties
+ios/Crimson.xcodeproj/
+ios/build/
+ios/Payload/
+*.ipa
