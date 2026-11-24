@@ -4,7 +4,7 @@ import SwiftUI
 
 struct RemotePad: View {
     @EnvironmentObject var tv: TVController
-    @Binding var showInputs: Bool
+    var openInputs: () -> Void
     @State private var playing = true
     @State private var more = false
 
@@ -21,7 +21,7 @@ struct RemotePad: View {
                 }
                 .buttonStyle(PressStyle())
                 Spacer()
-                Button { Haptics.tap(); showInputs = true } label: {
+                Button { Haptics.tap(); openInputs() } label: {
                     Text("Input")
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(Theme.text)
@@ -158,7 +158,7 @@ struct DPad: View {
     var body: some View {
         ZStack {
             Circle()
-                .fill(LinearGradient(colors: [Color(hex: 0x22222C), Theme.surface], startPoint: .top, endPoint: .bottom))
+                .fill(LinearGradient(colors: [Theme.raised, Theme.surface], startPoint: .top, endPoint: .bottom))
                 .overlay(Circle().stroke(Theme.stroke))
             VStack {
                 arrow("chevron.up", "KEY_UP")
@@ -451,7 +451,7 @@ struct InputSheet: View {
             ForEach(tv.sources) { s in
                 Button { tv.choose(s); dismiss() } label: {
                     HStack(spacing: 12) {
-                        Circle().fill(s.hasSignal ? Theme.green : Color(hex: 0x3A3A48)).frame(width: 8, height: 8)
+                        Circle().fill(s.hasSignal ? Theme.green : Theme.track).frame(width: 8, height: 8)
                         Text(s.displayName).font(.system(size: 16, weight: .medium)).foregroundStyle(Theme.text)
                         Spacer()
                         if s.displayName != s.sourceName {
@@ -466,8 +466,6 @@ struct InputSheet: View {
             Spacer()
         }
         .padding(22)
-        .presentationBackground(Color(hex: 0x15151C))
-        .preferredColorScheme(.dark)
     }
 }
 
@@ -505,51 +503,7 @@ struct PairingSheet: View {
                 .foregroundStyle(Theme.sub)
         }
         .padding(22)
-        .presentationBackground(Color(hex: 0x15151C))
-        .preferredColorScheme(.dark)
         .onAppear { focused = true }
         .onChange(of: tv.pairingFailed) { failed in if failed { code = "" } }
-    }
-}
-
-struct SettingsSheet: View {
-    @EnvironmentObject var tv: TVController
-    @Environment(\.dismiss) private var dismiss
-    @State private var ip = ""
-    @State private var mac = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Settings").font(.system(size: 20, weight: .heavy))
-            Text("The TV is found automatically. Add its MAC address to turn it on from standby.")
-                .font(.system(size: 13)).foregroundStyle(Theme.sub)
-            field("TV address", text: $ip, keyboard: .decimalPad)
-            field("TV MAC address (e.g. AA:BB:CC:DD:EE:FF)", text: $mac, keyboard: .asciiCapable)
-            Button {
-                tv.saveSettings(ip: ip, mac: mac)
-                dismiss()
-            } label: {
-                Text("Save").font(.system(size: 16, weight: .bold)).foregroundStyle(.white)
-                    .frame(maxWidth: .infinity).frame(height: 52)
-                    .background(Capsule().fill(Theme.crimsonGradient))
-            }
-            .buttonStyle(PressStyle(scale: 0.97))
-            .padding(.top, 4)
-            Spacer()
-        }
-        .padding(22)
-        .presentationBackground(Color(hex: 0x15151C))
-        .preferredColorScheme(.dark)
-        .onAppear { ip = tv.ip; mac = tv.mac }
-    }
-
-    private func field(_ placeholder: String, text: Binding<String>, keyboard: UIKeyboardType) -> some View {
-        TextField("", text: text, prompt: Text(placeholder).foregroundColor(Theme.faint))
-            .keyboardType(keyboard)
-            .textInputAutocapitalization(.characters)
-            .autocorrectionDisabled()
-            .foregroundStyle(Theme.text)
-            .padding(14)
-            .card(radius: 14)
     }
 }

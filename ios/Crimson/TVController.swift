@@ -36,6 +36,14 @@ struct TVApp: Identifiable, Hashable {
     }
 }
 
+/// A TV found on this Wi-Fi.
+struct TVDevice: Identifiable, Hashable {
+    var id: String { ip }
+    let ip: String
+    var name: String
+    var model: String?
+}
+
 struct TVSource: Identifiable, Hashable {
     var id: String { sourceId }
     let sourceId: String
@@ -58,6 +66,17 @@ final class TVController: ObservableObject {
     @Published var showPairing = false
     @Published var pairingFailed = false
     @Published var toast: String?
+    @Published var devices: [TVDevice] = []
+    @Published var scanning = false
+    @Published var connectedIP: String?
+
+    /// The connected TV's own name, or its model while the name is unknown.
+    var displayName: String {
+        if let ip = connectedIP ?? (ip.isEmpty ? nil : ip), let d = devices.first(where: { $0.ip == ip }), !d.name.hasPrefix("TV at") {
+            return d.name
+        }
+        return model
+    }
 
     private var client: MQTTClient?
     private let defaults = UserDefaults.standard
@@ -91,21 +110,56 @@ final class TVController: ObservableObject {
 
     // MARK: - Connection
 
+    /// Connects to the chosen TV, or the first one found, and keeps the device list fresh.
     func connect() {
         connectTask?.cancel()
         connectTask = Task {
             if client?.isConnected == true { return }
             status = .connecting
-            if !ip.isEmpty, await attempt(ip) { return }
+            if !ip.isEmpty, await attempt(ip) {
+                Task { await discover() }
+                return
+            }
             status = .searching
-            if let found = await Self.scan(prefix: prefix()), await attempt(found) {
-                ip = found
+            await discover()
+            let preferred = devices.first { $0.ip == ip } ?? devices.first
+            if let target = preferred, await attempt(target.ip) {
+                ip = target.ip
+                if devices.count > 1 { show("Found \(devices.count) TVs · connected to \(target.name)") }
                 return
             }
             status = .offline
             nowTitle = "TV is off"
             nowSubtitle = mac.isEmpty ? "Turn it on, and keep the iPhone on the same Wi-Fi" : "Tap power to wake it"
         }
+    }
+
+    /// Scans the Wi-Fi for every TV and looks up its name.
+    func discover() async {
+        scanning = true
+        defer { scanning = false }
+        let hosts = await Self.scanAll(prefix: prefix())
+        var found: [TVDevice] = []
+        for host in hosts {
+            let info = await Self.describe(host)
+            found.append(TVDevice(ip: host, name: info.name ?? "TV at \(host)", model: info.model))
+        }
+        if let current = connectedIP, !found.contains(where: { $0.ip == current }) {
+            found.insert(TVDevice(ip: current, name: model, model: nil), at: 0)
+        }
+        withAnimation(.easeOut(duration: 0.25)) { devices = found.sorted { $0.ip.compare($1.ip, options: .numeric) == .orderedAscending } }
+    }
+
+    /// Switches to another TV from the list.
+    func select(_ device: TVDevice) {
+        Haptics.tap()
+        guard device.ip != connectedIP else { return }
+        ip = device.ip
+        disconnect()
+        connectedIP = nil
+        nowTitle = "Connecting…"
+        nowSubtitle = device.name
+        connect()
     }
 
     func disconnect() {
@@ -136,6 +190,7 @@ final class TVController: ObservableObject {
         }
         if ok {
             client = c
+            connectedIP = host
             c.subscribe("/remoteapp/mobile/#")
             status = .connected
             refresh()
@@ -148,6 +203,7 @@ final class TVController: ObservableObject {
     private func connectionLost(_ c: MQTTClient) {
         guard client === c else { return }
         client = nil
+        connectedIP = nil
         if status == .connected || status == .pairing { status = .offline }
     }
 
@@ -163,6 +219,34 @@ final class TVController: ObservableObject {
         if !ip.isEmpty, let dot = ip.lastIndex(of: ".") { return String(ip[...dot]) }
         guard let own = Self.wifiAddress(), let dot = own.lastIndex(of: ".") else { return nil }
         return String(own[...dot])
+    }
+
+    /// Every address on this Wi-Fi that answers on the TV remote port.
+    nonisolated static func scanAll(prefix: String?) async -> [String] {
+        guard let prefix else { return [] }
+        return await withTaskGroup(of: String?.self) { group in
+            for i in 1..<255 {
+                group.addTask { await probe(prefix + String(i)) ? prefix + String(i) : nil }
+            }
+            var hits: [String] = []
+            for await hit in group { if let hit { hits.append(hit) } }
+            return hits
+        }
+    }
+
+    /// Reads the TV's own name from its media-renderer description, when it has one.
+    nonisolated static func describe(_ host: String) async -> (name: String?, model: String?) {
+        guard let url = URL(string: "http://\(host):38400/MediaServer/rendererdevicedesc.xml") else { return (nil, nil) }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2.5
+        guard let (data, _) = try? await URLSession.shared.data(for: req) else { return (nil, nil) }
+        let xml = String(decoding: data, as: UTF8.self)
+        func tag(_ t: String) -> String? {
+            guard let a = xml.range(of: "<\(t)>"), let b = xml.range(of: "</\(t)>", range: a.upperBound..<xml.endIndex) else { return nil }
+            let v = String(xml[a.upperBound..<b.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return v.isEmpty ? nil : v
+        }
+        return (tag("friendlyName"), tag("modelName"))
     }
 
     /// Finds the TV by trying its remote-control port on every address of this Wi-Fi.
@@ -408,8 +492,9 @@ final class TVController: ObservableObject {
 }
 
 enum Haptics {
-    static func tap() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-    static func heavy() { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
-    static func tick() { UISelectionFeedbackGenerator().selectionChanged() }
-    static func error() { UINotificationFeedbackGenerator().notificationOccurred(.error) }
+    static var enabled: Bool { UserDefaults.standard.object(forKey: "haptics") as? Bool ?? true }
+    static func tap() { if enabled { UIImpactFeedbackGenerator(style: .light).impactOccurred() } }
+    static func heavy() { if enabled { UIImpactFeedbackGenerator(style: .medium).impactOccurred() } }
+    static func tick() { if enabled { UISelectionFeedbackGenerator().selectionChanged() } }
+    static func error() { if enabled { UINotificationFeedbackGenerator().notificationOccurred(.error) } }
 }
