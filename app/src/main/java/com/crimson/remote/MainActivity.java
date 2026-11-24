@@ -72,8 +72,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     // Tabs
     FrameLayout pages;
-    View[] pageViews = new View[3];
-    TextView[] tabLabels = new TextView[3];
+    View[] pageViews = new View[4];
+    TextView[] tabLabels = new TextView[4];
     View tabIndicator;
     int currentTab;
 
@@ -927,6 +927,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         pageViews[0] = remotePage();
         pageViews[1] = touchpadPage();
         pageViews[2] = keyboardPage();
+        pageViews[3] = castPage();
         for (View v : pageViews) pages.addView(v, new FrameLayout.LayoutParams(-1, -2));
         root.addView(pages, margins(-1, -2, 0, 18));
 
@@ -1080,8 +1081,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         f.addView(tabIndicator, new FrameLayout.LayoutParams(0, -1));
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        String[] names = {"Remote", "Touchpad", "Keyboard"};
-        for (int i = 0; i < 3; i++) {
+        String[] names = {"Remote", "Touchpad", "Keys", "Cast"};
+        for (int i = 0; i < 4; i++) {
             final int idx = i;
             TextView t = text(this, names[i], 14, SUB, 500);
             t.setGravity(Gravity.CENTER);
@@ -1091,7 +1092,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         }
         f.addView(row, new FrameLayout.LayoutParams(-1, -1));
         f.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
-            int w = (r - l - dp(this, 8)) / 3;
+            int w = (r - l - dp(this, 8)) / 4;
             ViewGroup.LayoutParams lp = tabIndicator.getLayoutParams();
             if (lp.width != w) {
                 lp.width = w;
@@ -1110,9 +1111,9 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             tabIndicator.animate().translationX(idx * w).setDuration(280)
                     .setInterpolator(new android.view.animation.OvershootInterpolator(0.9f)).start();
         } else tabIndicator.setTranslationX(idx * w);
-        for (int i = 0; i < 3; i++) tabLabels[i].setTextColor(i == idx ? Color.WHITE : SUB);
+        for (int i = 0; i < 4; i++) tabLabels[i].setTextColor(i == idx ? Color.WHITE : SUB);
 
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             final View v = pageViews[i];
             if (i == idx) {
                 v.setVisibility(View.VISIBLE);
@@ -1125,7 +1126,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             } else v.setVisibility(View.GONE);
         }
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
-        if (idx == 2) {
+        if (idx == 2 && typeBox != null) {
             typeBox.requestFocus();
             typeBox.postDelayed(() -> imm.showSoftInput(typeBox, 0), 250);
         } else if (typeBox != null) {
@@ -1356,6 +1357,124 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     }
 
     // ---------------------------------------------------------------- Keyboard page
+
+    // ---------------------------------------------------------------- Cast page
+
+    static final int PICK_MEDIA = 41;
+    Caster caster;
+    TextView castStatus;
+
+    View castPage() {
+        LinearLayout p = new LinearLayout(this);
+        p.setOrientation(LinearLayout.VERTICAL);
+
+        p.addView(castCard(Icon.PLAY, "Photos, videos & music",
+                "Send a file from this phone to the TV over Wi-Fi.", "Choose a file", () -> {
+                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    i.addCategory(Intent.CATEGORY_OPENABLE);
+                    i.setType("*/*");
+                    i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*", "audio/*"});
+                    startActivityForResult(i, PICK_MEDIA);
+                }));
+
+        LinearLayout controls = row();
+        String[][] c = {{"Play", "play"}, {"Pause", "pause"}, {"Stop", "stop"}};
+        for (String[] b : c) {
+            TextView t = chip(b[0]);
+            press(t, () -> castControl(b[1]), false);
+            controls.addView(t, chipLp(1));
+        }
+        p.addView(controls, margins(-1, -2, 0, 10));
+        castStatus = text(this, "Nothing casting", 12, FAINT, 400);
+        castStatus.setGravity(Gravity.CENTER);
+        p.addView(castStatus, margins(-1, -2, 0, 8));
+
+        p.addView(castCard(Icon.MIRROR, "Mirror this phone",
+                "Shows your phone screen on the TV. On the TV open Screen Share (Anyview Cast) first.",
+                "Open screen cast", this::openScreenCast), margins(-1, -2, 0, 16));
+
+        p.addView(castCard(Icon.DESKTOP, "Crimson Desktop",
+                "A desktop on the TV while your phone becomes the trackpad. Start mirroring first.",
+                "Open desktop", this::openDesktop), margins(-1, -2, 0, 12));
+        return p;
+    }
+
+    View castCard(int icon, String title, String desc, String action, Runnable run) {
+        LinearLayout card = group();
+        card.setPadding(dp(this, 16), dp(this, 16), dp(this, 16), dp(this, 16));
+        LinearLayout top = row();
+        FrameLayout ic = new FrameLayout(this);
+        ic.setBackground(shape(CRIMSON_SOFT, dp(this, 12), 0, this));
+        ic.addView(new Icon(this, icon, CRIMSON), new FrameLayout.LayoutParams(dp(this, 22), dp(this, 22), Gravity.CENTER));
+        top.addView(ic, new LinearLayout.LayoutParams(dp(this, 44), dp(this, 44)));
+        LinearLayout t = new LinearLayout(this);
+        t.setOrientation(LinearLayout.VERTICAL);
+        t.setPadding(dp(this, 14), 0, 0, 0);
+        t.addView(text(this, title, 16, TEXT, 500));
+        TextView d = text(this, desc, 12, SUB, 400);
+        d.setLineSpacing(0, 1.15f);
+        t.addView(d, margins(-1, -2, 0, 4));
+        top.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+        card.addView(top);
+        TextView go = text(this, action, 14, Color.WHITE, 500);
+        go.setGravity(Gravity.CENTER);
+        go.setBackground(ripple(gradient(CRIMSON, CRIMSON_DARK, dp(this, 22))));
+        press(go, run, false);
+        card.addView(go, margins(-1, dp(this, 44), 0, 14));
+        return card;
+    }
+
+    @Override protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req != PICK_MEDIA || res != RESULT_OK || data == null || data.getData() == null) return;
+        final android.net.Uri uri = data.getData();
+        final String tv = connectedIp != null ? connectedIp : ip();
+        if (tv.isEmpty()) { toast("Connect to a TV first"); return; }
+        if (caster == null) caster = new Caster(this);
+        castStatus.setText("Sending to the TV…");
+        new Thread(() -> {
+            try {
+                caster.cast(tv, uri);
+                String name = caster.displayName(uri);
+                MAIN.post(() -> { castStatus.setText("Casting " + caster.kind() + ": " + name); toast("Casting to the TV"); });
+            } catch (Exception e) {
+                MAIN.post(() -> { castStatus.setText(String.valueOf(e.getMessage())); toast(String.valueOf(e.getMessage())); });
+            }
+        }).start();
+    }
+
+    void castControl(String what) {
+        if (caster == null) { toast("Choose a file to cast first"); return; }
+        buzz(this, 10);
+        new Thread(() -> {
+            try {
+                if (what.equals("play")) caster.play(); else if (what.equals("pause")) caster.pause(); else caster.stop();
+                if (what.equals("stop")) MAIN.post(() -> castStatus.setText("Nothing casting"));
+            } catch (Exception e) {
+                MAIN.post(() -> toast(String.valueOf(e.getMessage())));
+            }
+        }).start();
+    }
+
+    /** Opens the phone's own screen-cast (Miracast) page. */
+    void openScreenCast() {
+        String[] actions = {"android.settings.CAST_SETTINGS", "android.settings.WIFI_DISPLAY_SETTINGS"};
+        for (String a : actions) {
+            try { startActivity(new Intent(a)); return; } catch (Exception ignored) {}
+        }
+        toast("This phone has no built-in screen cast");
+    }
+
+    void openDesktop() {
+        android.hardware.display.DisplayManager dm = (android.hardware.display.DisplayManager) getSystemService(DISPLAY_SERVICE);
+        android.view.Display[] ds = dm.getDisplays(android.hardware.display.DisplayManager.DISPLAY_CATEGORY_PRESENTATION);
+        if (ds.length == 0) {
+            toast("Start mirroring to the TV first, then open the desktop");
+            openScreenCast();
+            return;
+        }
+        startActivity(new Intent(this, DesktopActivity.class));
+    }
 
     View keyboardPage() {
         LinearLayout p = new LinearLayout(this);
@@ -1691,7 +1810,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     /** Small line icons drawn in code so they match on every phone. */
     static class Icon extends View {
-        static final int TV = 0, GEAR = 1, SUN = 2, MOON = 3, HALF = 4, REMOTE = 5;
+        static final int TV = 0, GEAR = 1, SUN = 2, MOON = 3, HALF = 4, REMOTE = 5, PLAY = 6, MIRROR = 7, DESKTOP = 8;
         final int kind;
         final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG), f = new Paint(Paint.ANTI_ALIAS_FLAG);
         Icon(Context c, int kind, int color) {
@@ -1740,6 +1859,21 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                 case HALF:
                     c.drawCircle(w / 2, h / 2, w * 0.4f, p);
                     c.drawArc(new RectF(w * 0.1f, h * 0.1f, w * 0.9f, h * 0.9f), 90, 180, true, f);
+                    break;
+                case PLAY: {
+                    android.graphics.Path t = new android.graphics.Path();
+                    t.moveTo(w * 0.3f, h * 0.18f); t.lineTo(w * 0.82f, h * 0.5f); t.lineTo(w * 0.3f, h * 0.82f); t.close();
+                    c.drawPath(t, f);
+                    break;
+                }
+                case MIRROR:
+                    c.drawRoundRect(new RectF(s, h * 0.12f, w * 0.7f, h * 0.7f), w * 0.08f, w * 0.08f, p);
+                    c.drawRoundRect(new RectF(w * 0.62f, h * 0.38f, w - s, h - s), w * 0.06f, w * 0.06f, p);
+                    break;
+                case DESKTOP:
+                    c.drawRoundRect(new RectF(s, h * 0.12f, w - s, h * 0.72f), w * 0.08f, w * 0.08f, p);
+                    c.drawLine(w * 0.5f, h * 0.72f, w * 0.5f, h * 0.88f, p);
+                    c.drawLine(w * 0.3f, h * 0.9f, w * 0.7f, h * 0.9f, p);
                     break;
                 case REMOTE:
                     c.drawRoundRect(new RectF(w * 0.3f, h * 0.05f, w * 0.7f, h * 0.95f), w * 0.1f, w * 0.1f, p);
