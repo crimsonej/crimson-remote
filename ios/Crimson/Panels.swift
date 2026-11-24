@@ -524,7 +524,7 @@ struct SettingsSheet: View {
             Text("The TV is found automatically. Add its MAC address to turn it on from standby.")
                 .font(.system(size: 13)).foregroundStyle(Theme.sub)
             field("TV address", text: $ip, keyboard: .decimalPad)
-            field("TV MAC address (e.g. 18:30:0C:…)", text: $mac, keyboard: .asciiCapable)
+            field("TV MAC address (e.g. AA:BB:CC:DD:EE:FF)", text: $mac, keyboard: .asciiCapable)
             Button {
                 tv.saveSettings(ip: ip, mac: mac)
                 dismiss()
