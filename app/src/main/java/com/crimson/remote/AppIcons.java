@@ -46,6 +46,20 @@ final class AppIcons {
         return null;
     }
 
+    /** Any image URL (e.g. an icon the TV serves). Blocking. */
+    static Bitmap loadUrl(String url) {
+        synchronized (cache) { if (cache.containsKey(url)) return cache.get(url); }
+        Bitmap b = null;
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(4000);
+            c.setReadTimeout(5000);
+            try (InputStream in = c.getInputStream()) { b = BitmapFactory.decodeStream(in); }
+        } catch (Exception ignored) {}
+        synchronized (cache) { cache.put(url, b); }
+        return b;
+    }
+
     /** Blocking; call off the main thread. Returns null when there is no logo. */
     static Bitmap load(String domain) {
         if (domain == null) return null;

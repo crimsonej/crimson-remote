@@ -68,3 +68,8 @@ keyboard and pointer support may vary by firmware.
 ## License
 
 MIT © crimson
+
+## Credits
+
+The LG webOS pairing manifest (`lg_manifest.json`) comes from
+[aiopylgtv](https://github.com/bendavid/aiopylgtv) by Dennis Karpienski, MIT License.

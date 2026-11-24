@@ -144,16 +144,57 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         final Mqtt m = mqtt;
         mqtt = null;
         if (m != null) net.execute(m::close);
+        final TvDriver d = driver;
+        driver = null;
+        if (d != null) net.execute(d::close);
     }
 
     // ================================================================ connection
+
+    /** The non-Hisense TV currently controlled (Roku, Samsung, LG), or null. */
+    volatile TvDriver driver;
+
+    String brandOf(String host) {
+        synchronized (devices) { for (String[] d : devices) if (d[0].equals(host)) return d[3]; }
+        return prefs.getString("brand_" + host, TvDriver.HISENSE);
+    }
+
+    boolean connectTo(String host) {
+        String brand = brandOf(host);
+        return TvDriver.HISENSE.equals(brand) ? tryConnect(host) : tryDriver(host, brand);
+    }
+
+    boolean tryDriver(String host, String brand) {
+        if (!resumed) return false;
+        TvDriver d = TvDriver.create(this, brand, host, new TvDriver.Listener() {
+            @Override public void onConnected() { MAIN.post(() -> { setStatus(GREEN, "Connected · " + host, false); refreshHeader(); }); }
+            @Override public void onDisconnected() {
+                MAIN.post(() -> { if (driver != null && driver.ip.equals(host)) { driver = null; connectedIp = null; setStatus(RED, "Disconnected · tap to reconnect", false); } });
+            }
+            @Override public void onPrompt(String m) { MAIN.post(() -> { setStatus(AMBER, "Waiting for the TV", true); swap(nowTitle, "Check your TV"); swap(nowSub, m); toast(m); }); }
+            @Override public void onState(String t, String sub) { MAIN.post(() -> { swap(nowTitle, t); swap(nowSub, sub); }); }
+            @Override public void onVolume(int v) { MAIN.post(() -> showVolume(v)); }
+            @Override public void onApps(JSONArray apps) { MAIN.post(() -> renderApps(apps)); }
+            @Override public void onSources(JSONArray src) { MAIN.post(() -> sources = src); }
+            @Override public void onModel(String model) {
+                prefs.edit().putString("name", model.trim()).apply();
+                MAIN.post(MainActivity.this::refreshHeader);
+            }
+        });
+        if (d == null || !d.connect()) return false;
+        driver = d;
+        connectedIp = host;
+        prefs.edit().putString("brand_" + host, brand).apply();
+        MAIN.post(() -> { refreshHeader(); volBar.setEnabled(d.canSetVolume()); });
+        return true;
+    }
 
     String ip() { return prefs.getString("ip", ""); }
 
     void connect() {
         setStatus(AMBER, "Connecting", true);
         net.execute(() -> {
-            if (!ip().isEmpty() && tryConnect(ip())) {
+            if (!ip().isEmpty() && connectTo(ip())) {
                 new Thread(this::discover).start();
                 return;
             }
@@ -166,7 +207,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             }
             if (target != null) {
                 prefs.edit().putString("ip", target[0]).apply();
-                if (tryConnect(target[0])) {
+                if (connectTo(target[0])) {
                     final String name = target[1];
                     final int count = devices.size();
                     if (count > 1) MAIN.post(() -> toast("Found " + count + " TVs · connected to " + name));
@@ -189,7 +230,9 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         try {
             m.connect();
             mqtt = m;
+            driver = null;
             connectedIp = host;
+            MAIN.post(() -> volBar.setEnabled(true));
             MAIN.post(this::refreshHeader);
             m.subscribe("/remoteapp/mobile/#");
             refresh();
@@ -215,27 +258,34 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         try {
             String prefix = localPrefix();
             if (prefix != null) {
-                ExecutorService pool = Executors.newFixedThreadPool(48);
+                ExecutorService pool = Executors.newFixedThreadPool(64);
+                final int[] ports = {36669, 8060, 8001, 8002, 3000, 3001};
                 for (int i = 1; i < 255; i++) {
                     final String host = prefix + i;
                     pool.execute(() -> {
-                        try (Socket s = new Socket()) {
-                            s.connect(new InetSocketAddress(host, PORT), 500);
-                            synchronized (hosts) { hosts.add(host); }
-                        } catch (Exception ignored) {}
+                        for (int port : ports) {
+                            if (TvDriver.open(host, port, 450)) {
+                                synchronized (hosts) { hosts.add(host); }
+                                return;
+                            }
+                        }
                     });
                 }
                 pool.shutdown();
-                pool.awaitTermination(10, TimeUnit.SECONDS);
+                pool.awaitTermination(25, TimeUnit.SECONDS);
             }
         } catch (Exception ignored) {}
         List<String[]> found = new ArrayList<>();
         for (String h : hosts) {
-            String[] info = describe(h);
-            found.add(new String[]{h, info[0] != null ? info[0] : "TV at " + h, info[1]});
+            String[] info = TvDriver.identify(h);   // {brand, name, model}
+            if (info == null) continue;
+            found.add(new String[]{h, info[1] != null ? info[1] : "TV at " + h, info[2], info[0]});
+            prefs.edit().putString("brand_" + h, info[0]).apply();
         }
         String cur = connectedIp;
-        if (cur != null && !hosts.contains(cur)) found.add(0, new String[]{cur, prefs.getString("name", "Your TV"), null});
+        boolean listed = false;
+        for (String[] d : found) if (d[0].equals(cur)) listed = true;
+        if (cur != null && !listed) found.add(0, new String[]{cur, prefs.getString("name", "Your TV"), null, prefs.getString("brand_" + cur, TvDriver.HISENSE)});
         java.util.Collections.sort(found, (a, b) -> Integer.compare(lastOctet(a[0]), lastOctet(b[0])));
         synchronized (devices) { devices.clear(); devices.addAll(found); }
         scanning = false;
@@ -300,8 +350,11 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         prefs.edit().putString("ip", d[0]).apply();
         final Mqtt m = mqtt;
         mqtt = null;
+        final TvDriver old = driver;
+        driver = null;
         connectedIp = null;
         if (m != null) net.execute(m::close);
+        if (old != null) net.execute(old::close);
         swap(nowTitle, "Connecting…");
         swap(nowSub, d[1]);
         connect();
@@ -480,7 +533,18 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     // ================================================================ commands
 
+    static String brandLabel(String b) {
+        if (b == null) return "TV";
+        switch (b) {
+            case TvDriver.ROKU: return "Roku";
+            case TvDriver.SAMSUNG: return "Samsung";
+            case TvDriver.LG: return "LG";
+            default: return "Hisense";
+        }
+    }
+
     void key(String k) {
+        if (driver != null) { buzz(this, 10); driver.key(k); return; }
         buzz(this, 10);
         final Mqtt m = mqtt;
         if (m == null) { notConnected(); return; }
@@ -488,6 +552,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     }
 
     void input(String code) {
+        if (driver != null) { driver.text(code); return; }
         final Mqtt m = mqtt;
         if (m == null) { notConnected(); return; }
         net.execute(() -> m.publish("/remoteapp/tv/remote_service/" + cid + "/actions/input", code));
@@ -508,6 +573,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     void power() {
         buzz(this, 25);
+        if (driver != null && driver.isConnected()) { driver.key("KEY_POWER"); return; }
         if (mqtt != null) { key("KEY_POWER"); return; }
         String mac = prefs.getString("mac", "");
         if (mac.isEmpty()) { askMac(); return; }
@@ -540,7 +606,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     void chooseInput() {
         buzz(this, 10);
-        if (mqtt == null) { notConnected(); return; }
+        if (mqtt == null && driver == null) { notConnected(); return; }
+        if (driver != null && sources.length() == 0) { driver.source(new JSONObject()); return; }  // e.g. Samsung: Source key
         final List<JSONObject> items = new ArrayList<>();
         List<String> labels = new ArrayList<>();
         for (int i = 0; i < sources.length(); i++) {
@@ -553,7 +620,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             if ("1".equals(s.optString("is_signal"))) label = "●  " + label; else label = "○  " + label;
             labels.add(label);
         }
-        if (items.isEmpty()) { toast("Loading inputs…"); action("ui_service", "sourcelist", ""); return; }
+        if (items.isEmpty()) { toast("Loading inputs…"); if (driver != null) driver.refresh(); else action("ui_service", "sourcelist", ""); return; }
         new AlertDialog.Builder(this, Ui.dialogTheme())
                 .setTitle("Choose input")
                 .setItems(labels.toArray(new String[0]), (d, which) -> {
@@ -562,7 +629,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                         JSONObject o = new JSONObject();
                         o.put("sourceid", s.optString("sourceid"));
                         o.put("sourcename", s.optString("sourcename"));
-                        action("ui_service", "changesource", o.toString());
+                        if (driver != null) driver.source(s); else action("ui_service", "changesource", o.toString());
                         toast("Switching to " + s.optString("displayname"));
                     } catch (Exception ignored) {}
                 })
@@ -570,6 +637,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     }
 
     void launchApp(JSONObject app) {
+        if (driver != null) { buzz(this, 10); driver.launch(app); toast("Opening " + app.optString("name").trim()); return; }
         buzz(this, 10);
         if (mqtt == null) { notConnected(); return; }
         try {
@@ -698,7 +766,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             t.setOrientation(LinearLayout.VERTICAL);
             t.setPadding(dp(this, 14), 0, dp(this, 8), 0);
             t.addView(text(this, d[1], 16, TEXT, 500));
-            TextView sub = text(this, (d[2] != null ? d[2] + " · " : "") + d[0], 12, SUB, 400);
+            TextView sub = text(this, brandLabel(d[3]) + " · " + (d[2] != null ? d[2] + " · " : "") + d[0], 12, SUB, 400);
             t.addView(sub, margins(-2, -2, 0, 4));
             r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
             TextView state = text(this, connected ? "Connected" : "Connect", 12, connected ? GREEN : CRIMSON, 500);
@@ -1055,13 +1123,13 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                 volValue.setText(String.valueOf(p));
                 if (System.currentTimeMillis() - lastVolSent > 120) {
                     lastVolSent = System.currentTimeMillis();
-                    action("platform_service", "changevolume", String.valueOf(p));
+                    if (driver != null) driver.setVolume(p); else action("platform_service", "changevolume", String.valueOf(p));
                 }
             }
             @Override public void onStartTrackingTouch(SeekBar s) { userDraggingVol = true; buzz(MainActivity.this, 8); }
             @Override public void onStopTrackingTouch(SeekBar s) {
                 userDraggingVol = false;
-                action("platform_service", "changevolume", String.valueOf(s.getProgress()));
+                if (driver != null) driver.setVolume(s.getProgress()); else action("platform_service", "changevolume", String.valueOf(s.getProgress()));
             }
         });
         volRow.addView(volBar, new LinearLayout.LayoutParams(0, dp(this, 36), 1));
@@ -1580,9 +1648,12 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             badgeBox.addView(logo, new FrameLayout.LayoutParams(-1, -1));
             tile.addView(badgeBox, new LinearLayout.LayoutParams(dp(this, 58), dp(this, 58)));
             final String domain = AppIcons.domain(name, app.optString("url"));
-            if (domain != null) {
+            final String tvIcon = app.optString("icon", "");
+            if (domain != null || !tvIcon.isEmpty()) {
                 new Thread(() -> {
-                    final android.graphics.Bitmap bm = AppIcons.load(domain);
+                    // The TV's own icon when it gives one (Roku, LG), otherwise the service's site icon.
+                    android.graphics.Bitmap first = tvIcon.isEmpty() ? null : AppIcons.loadUrl(tvIcon);
+                    final android.graphics.Bitmap bm = first != null ? first : AppIcons.load(domain);
                     if (bm == null) return;
                     MAIN.post(() -> {
                         logo.setImageBitmap(bm);

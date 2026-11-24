@@ -43,17 +43,57 @@ public class Caster {
     /** Finds the TV's AVTransport control address. Blocking. */
     public boolean prepare(String tvIp) {
         if (controlUrl != null && controlUrl.contains(tvIp)) return true;
+        // Known description addresses first (Hisense, Samsung), then ask the network (SSDP).
+        String[] known = {"http://" + tvIp + ":38400/MediaServer/rendererdevicedesc.xml", "http://" + tvIp + ":9197/dmr"};
+        for (String desc : known) if (useDescription(desc)) return true;
+        String found = ssdpLocation(tvIp);
+        return found != null && useDescription(found);
+    }
+
+    private boolean useDescription(String descUrl) {
         try {
-            String base = "http://" + tvIp + ":38400";
-            String xml = get(base + "/MediaServer/rendererdevicedesc.xml");
-            controlUrl = absolute(base, serviceControl(xml, "AVTransport"));
+            String xml = get(descUrl);
+            URL u = new URL(descUrl);
+            String base = u.getProtocol() + "://" + u.getHost() + ":" + u.getPort();
+            String path = serviceControl(xml, "AVTransport");
+            if (path == null) return false;
+            controlUrl = path.startsWith("http") ? path
+                    : path.startsWith("/") ? base + path
+                    : descUrl.substring(0, descUrl.lastIndexOf('/') + 1) + path;
             String rc = serviceControl(xml, "RenderingControl");
             renderingUrl = rc == null ? null : absolute(base, rc);
-            return controlUrl != null;
+            return true;
         } catch (Exception e) {
-            controlUrl = null;
             return false;
         }
+    }
+
+    /** Asks the network for media renderers and returns the one at this TV's address. */
+    private String ssdpLocation(String tvIp) {
+        android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager) ctx.getSystemService(Context.WIFI_SERVICE);
+        android.net.wifi.WifiManager.MulticastLock lock = wm == null ? null : wm.createMulticastLock("crimson-ssdp");
+        try (java.net.DatagramSocket sock = new java.net.DatagramSocket()) {
+            if (lock != null) lock.acquire();
+            sock.setSoTimeout(800);
+            byte[] q = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\n"
+                    + "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n").getBytes(UTF8);
+            java.net.InetAddress group = java.net.InetAddress.getByName("239.255.255.250");
+            for (int i = 0; i < 2; i++) sock.send(new java.net.DatagramPacket(q, q.length, group, 1900));
+            long end = System.currentTimeMillis() + 3500;
+            byte[] buf = new byte[2048];
+            while (System.currentTimeMillis() < end) {
+                java.net.DatagramPacket pk = new java.net.DatagramPacket(buf, buf.length);
+                try { sock.receive(pk); } catch (java.net.SocketTimeoutException t) { continue; }
+                if (!pk.getAddress().getHostAddress().equals(tvIp)) continue;
+                for (String line : new String(pk.getData(), 0, pk.getLength(), UTF8).split("\r\n")) {
+                    if (line.toLowerCase().startsWith("location:")) return line.substring(9).trim();
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (lock != null && lock.isHeld()) lock.release();
+        }
+        return null;
     }
 
     /** Serves the chosen file and asks the TV to play it. Blocking; throws with a readable message. */
