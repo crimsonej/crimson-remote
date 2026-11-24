@@ -275,7 +275,7 @@ struct ConnectionCard: View {
         case .connected: return [tv.current?.brand.label, tv.connectedIP].compactMap { $0 }.joined(separator: " · ")
         case .connecting: return tv.current?.ip ?? ""
         case .searching: return "This takes a few seconds"
-        case .offline: return tv.current?.canWake == true ? "It may be off. Tap Turn on." : "It may be off, or on another Wi-Fi"
+        case .offline: return tv.statusNote ?? (tv.current?.canWake == true ? "It may be off. Tap Turn on." : "It may be off, or on another Wi-Fi")
         case .pairing: return tv.statusNote ?? "Approve Crimson on the TV"
         case .disconnected: return "Tap Connect when you want to use the TV"
         case .none: return "Turn a TV on and keep this iPhone on the same Wi-Fi"

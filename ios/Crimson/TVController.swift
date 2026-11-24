@@ -209,6 +209,7 @@ final class TVController: ObservableObject {
     /// Connect / Reconnect button: start again from scratch.
     func reconnect() {
         userDisconnected = false
+        statusNote = nil
         closeConnection()
         connect()
     }
@@ -491,6 +492,7 @@ final class TVController: ObservableObject {
         Haptics.heavy()
         userDisconnected = false
         status = .waking
+        statusNote = nil
         connectTask?.cancel()
         connectTask = Task {
             await sendWake(tv)
@@ -501,12 +503,16 @@ final class TVController: ObservableObject {
                 // The TV may come back on a new address.
                 if let d = devices.first(where: { $0.mac == tv.mac }), d.ip != tv.ip, await openFound(d) { return }
             }
-            if !isLive { status = .offline }
+            if !isLive {
+                status = .offline
+                statusNote = "It didn't wake. Turn on \u{201C}Wake on LAN\u{201D} or \u{201C}Wake on Wi-Fi\u{201D} in the TV's network settings, or use its remote."
+            }
         }
     }
 
-    /// Wake-on-LAN. An iPhone app may not broadcast, so it sends the packet to the TV's
-    /// last address and also asks any Crimson bridge on the Wi-Fi (Android app or computer) to broadcast it.
+    /// Wake-on-LAN, sent from this iPhone only. Apps installed outside the App Store may not
+    /// broadcast, so the packet goes straight to the TV's last address (and the subnet broadcast,
+    /// which iOS may block). That wakes TVs that keep their network on in standby.
     private func sendWake(_ tv: SavedTV) async {
         let hex = tv.mac.replacingOccurrences(of: ":", with: "")
         var bytes = [UInt8]()
@@ -522,23 +528,6 @@ final class TVController: ObservableObject {
                 conn.start(queue: .global())
                 for _ in 0..<3 { conn.send(content: packet, completion: .contentProcessed { _ in }) }
                 DispatchQueue.global().asyncAfter(deadline: .now() + 2) { conn.cancel() }
-            }
-        }
-        // Ask Crimson bridges to broadcast it properly.
-        guard let p = prefix() else { return }
-        await withTaskGroup(of: Void.self) { group in
-            for n in 1..<255 {
-                group.addTask {
-                    let host = p + String(n)
-                    guard await TVDriver.tcpOpen(host, 8787, timeout: 0.6),
-                          let url = URL(string: "http://\(host):8787/api/wake") else { return }
-                    var r = URLRequest(url: url)
-                    r.httpMethod = "POST"
-                    r.timeoutInterval = 3
-                    r.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    r.httpBody = try? JSONSerialization.data(withJSONObject: ["mac": tv.mac])
-                    _ = try? await URLSession.shared.data(for: r)
-                }
             }
         }
     }
