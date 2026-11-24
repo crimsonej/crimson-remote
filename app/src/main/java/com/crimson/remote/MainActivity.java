@@ -98,7 +98,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             cid = "Crimson-" + UUID.randomUUID().toString().substring(0, 8);
             prefs.edit().putString("cid", cid).apply();
         }
-        applyExtras(getIntent());
+        store = new TvStore(this);
         Ui.applyTheme(this);
         Window w = getWindow();
         w.setStatusBarColor(BG_TOP);
@@ -112,25 +112,9 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         setContentView(build());
         renderApps(null);
         showTab(0, false);
+        refreshHeader();
     }
 
-    @Override protected void onNewIntent(Intent i) {
-        super.onNewIntent(i);
-        applyExtras(i);
-    }
-
-    /** Optional: `am start -e ip 192.168.1.x -e mac AA:BB:.. [-e cid <paired id>]` pre-fills the TV. */
-    void applyExtras(Intent i) {
-        if (i == null) return;
-        SharedPreferences.Editor e = prefs.edit();
-        if (i.getStringExtra("ip") != null) e.putString("ip", i.getStringExtra("ip"));
-        if (i.getStringExtra("mac") != null) e.putString("mac", i.getStringExtra("mac"));
-        if (i.getStringExtra("cid") != null) { cid = i.getStringExtra("cid"); e.putString("cid", cid); }
-        String bridgeExtra = i.getStringExtra("bridge");
-        e.apply();
-        if ("on".equals(bridgeExtra)) { prefs.edit().putBoolean("bridge_on", true).apply(); BridgeService.start(this); }
-        if ("off".equals(bridgeExtra)) { prefs.edit().putBoolean("bridge_on", false).apply(); BridgeService.stop(this); }
-    }
 
     @Override protected void onResume() {
         super.onResume();
@@ -151,77 +135,149 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     // ================================================================ connection
 
+    // Connection states shown on the connection card.
+    static final int ST_IDLE = 0, ST_SEARCHING = 1, ST_CONNECTING = 2, ST_CONNECTED = 3, ST_OFFLINE = 4,
+            ST_PAIRING = 5, ST_DISCONNECTED = 6, ST_NONE = 7, ST_CHOOSE = 8, ST_WAKING = 9;
+    volatile int connState = ST_IDLE;
+    volatile boolean userDisconnected;
+    TvStore store;
+
     /** The non-Hisense TV currently controlled (Roku, Samsung, LG), or null. */
     volatile TvDriver driver;
 
-    String brandOf(String host) {
-        synchronized (devices) { for (String[] d : devices) if (d[0].equals(host)) return d[3]; }
-        return prefs.getString("brand_" + host, TvDriver.HISENSE);
-    }
+    boolean isConnected() { return (mqtt != null && mqtt.isConnected()) || (driver != null && driver.isConnected()); }
 
-    boolean connectTo(String host) {
-        String brand = brandOf(host);
-        return TvDriver.HISENSE.equals(brand) ? tryConnect(host) : tryDriver(host, brand);
-    }
+    TvStore.Tv currentTv() { return store.current(); }
 
-    boolean tryDriver(String host, String brand) {
-        if (!resumed) return false;
-        TvDriver d = TvDriver.create(this, brand, host, new TvDriver.Listener() {
-            @Override public void onConnected() { MAIN.post(() -> { setStatus(GREEN, "Connected · " + host, false); refreshHeader(); }); }
-            @Override public void onDisconnected() {
-                MAIN.post(() -> { if (driver != null && driver.ip.equals(host)) { driver = null; connectedIp = null; setStatus(RED, "Disconnected · tap to reconnect", false); } });
+    /** Automatic connect (app opened). Does nothing if you pressed Disconnect. */
+    void connect() {
+        if (userDisconnected) { renderConnection(); return; }
+        if (isConnected()) { setState(ST_CONNECTED, null); return; }
+        final TvStore.Tv cur = currentTv();
+        setState(cur == null ? ST_SEARCHING : ST_CONNECTING, null);
+        net.execute(() -> {
+            if (cur != null && open(cur)) return;
+            setStateBg(ST_SEARCHING, null);
+            discover();
+            if (cur != null) {
+                String[] match = findSaved(cur);
+                if (match != null && openFound(match)) return;
+                setStateBg(ST_OFFLINE, null);
+                return;
             }
-            @Override public void onPrompt(String m) { MAIN.post(() -> { setStatus(AMBER, "Waiting for the TV", true); swap(nowTitle, "Check your TV"); swap(nowSub, m); toast(m); }); }
+            List<String[]> list;
+            synchronized (devices) { list = new ArrayList<>(devices); }
+            if (list.isEmpty()) { setStateBg(ST_NONE, null); return; }
+            if (list.size() == 1) { if (!openFound(list.get(0))) setStateBg(ST_OFFLINE, null); return; }
+            setStateBg(ST_CHOOSE, null);
+            MAIN.post(this::devicesSheet);
+        });
+    }
+
+    /** Connect button: start again from scratch. */
+    void reconnect() {
+        userDisconnected = false;
+        closeConnection();
+        connect();
+    }
+
+    /** Disconnect button: stays disconnected until you connect again. */
+    void disconnectNow() {
+        userDisconnected = true;
+        closeConnection();
+        setState(ST_DISCONNECTED, null);
+    }
+
+    void closeConnection() {
+        final Mqtt m = mqtt;
+        mqtt = null;
+        final TvDriver d = driver;
+        driver = null;
+        connectedIp = null;
+        if (m != null) net.execute(m::close);
+        if (d != null) net.execute(d::close);
+    }
+
+    /** A found TV ({ip, name, model, brand, mac}) that is the saved one. */
+    String[] findSaved(TvStore.Tv t) {
+        synchronized (devices) {
+            for (String[] d : devices) {
+                String mac = TvStore.normalMac(d[4]);
+                if (!t.mac.isEmpty() && t.mac.equals(mac)) return d;
+            }
+            for (String[] d : devices) if (d[0].equals(t.ip) && d[3].equals(t.brand)) return d;
+        }
+        return null;
+    }
+
+    /** Saves a found TV and connects to it. */
+    boolean openFound(String[] d) {
+        TvStore.Tv t = new TvStore.Tv();
+        t.ip = d[0]; t.name = d[1]; t.model = d[2]; t.brand = d[3]; t.mac = d[4];
+        TvStore.Tv saved = store.save(t);
+        store.setCurrent(saved.id);
+        return open(saved);
+    }
+
+    boolean open(TvStore.Tv t) {
+        setStateBg(ST_CONNECTING, null);
+        return TvDriver.HISENSE.equals(t.brand) ? tryConnect(t.ip) : tryDriver(t);
+    }
+
+    /** Learns the TV's name, model and MAC after connecting and saves them. */
+    void learn(String host) {
+        new Thread(() -> {
+            String[] info = TvDriver.identify(host);
+            if (info == null) return;
+            TvStore.Tv t = currentTv();
+            if (t == null) t = new TvStore.Tv();
+            t.ip = host; t.brand = info[0];
+            if (info[1] != null) t.name = info[1];
+            if (info[2] != null) t.model = info[2];
+            if (info[3] != null) t.mac = info[3];
+            TvStore.Tv saved = store.save(t);
+            store.setCurrent(saved.id);
+            MAIN.post(this::refreshHeader);
+        }).start();
+    }
+
+    boolean tryDriver(TvStore.Tv tv) {
+        if (!resumed) return false;
+        final String host = tv.ip;
+        TvDriver d = TvDriver.create(this, tv.brand, host, tv.id, new TvDriver.Listener() {
+            @Override public void onConnected() { connectedIp = host; setStateBg(ST_CONNECTED, null); MAIN.post(MainActivity.this::refreshHeader); }
+            @Override public void onDisconnected() {
+                MAIN.post(() -> {
+                    if (driver != null && driver.ip.equals(host)) { driver = null; connectedIp = null; if (!userDisconnected) setState(ST_OFFLINE, null); }
+                });
+            }
+            @Override public void onPrompt(String m) { setStateBg(ST_PAIRING, m); MAIN.post(() -> { swap(nowTitle, "Check your TV"); swap(nowSub, m); }); }
             @Override public void onState(String t, String sub) { MAIN.post(() -> { swap(nowTitle, t); swap(nowSub, sub); }); }
             @Override public void onVolume(int v) { MAIN.post(() -> showVolume(v)); }
             @Override public void onApps(JSONArray apps) { MAIN.post(() -> renderApps(apps)); }
             @Override public void onSources(JSONArray src) { MAIN.post(() -> sources = src); }
             @Override public void onModel(String model) {
-                prefs.edit().putString("name", model.trim()).apply();
+                TvStore.Tv t = currentTv();
+                if (t != null) { t.model = model.trim(); store.save(t); }
+                MAIN.post(MainActivity.this::refreshHeader);
+            }
+            @Override public void onMac(String mac) {
+                TvStore.Tv t = currentTv();
+                if (t != null && TvStore.normalMac(mac).length() == 17) { t.mac = mac; store.setCurrent(store.save(t).id); }
                 MAIN.post(MainActivity.this::refreshHeader);
             }
         });
         if (d == null || !d.connect()) return false;
+        final TvDriver old = driver;
+        if (old != null) old.close();
+        final Mqtt m = mqtt;
+        mqtt = null;
+        if (m != null) m.close();
         driver = d;
         connectedIp = host;
-        prefs.edit().putString("brand_" + host, brand).apply();
+        if (connState != ST_PAIRING) setStateBg(ST_CONNECTED, null);
         MAIN.post(() -> { refreshHeader(); volBar.setEnabled(d.canSetVolume()); });
         return true;
-    }
-
-    String ip() { return prefs.getString("ip", ""); }
-
-    void connect() {
-        setStatus(AMBER, "Connecting", true);
-        net.execute(() -> {
-            if (!ip().isEmpty() && connectTo(ip())) {
-                new Thread(this::discover).start();
-                return;
-            }
-            MAIN.post(() -> setStatus(AMBER, "Looking for TVs", true));
-            discover();
-            String[] target = null;
-            synchronized (devices) {
-                for (String[] d : devices) if (d[0].equals(ip())) target = d;
-                if (target == null && !devices.isEmpty()) target = devices.get(0);
-            }
-            if (target != null) {
-                prefs.edit().putString("ip", target[0]).apply();
-                if (connectTo(target[0])) {
-                    final String name = target[1];
-                    final int count = devices.size();
-                    if (count > 1) MAIN.post(() -> toast("Found " + count + " TVs · connected to " + name));
-                    return;
-                }
-            }
-            MAIN.post(() -> {
-                setStatus(RED, "TV not found · tap to retry", false);
-                swap(nowTitle, "TV is off or unreachable");
-                swap(nowSub, prefs.getString("mac", "").isEmpty()
-                        ? "Turn it on and make sure the phone is on the same Wi-Fi"
-                        : "Tap the power button to wake it");
-            });
-        });
     }
 
     boolean tryConnect(String host) {
@@ -229,13 +285,15 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         Mqtt m = new Mqtt(host, PORT, cid, "hisenseservice", "multimqttservice", this);
         try {
             m.connect();
-            mqtt = m;
+            final TvDriver old = driver;
             driver = null;
+            if (old != null) old.close();
+            mqtt = m;
             connectedIp = host;
-            MAIN.post(() -> volBar.setEnabled(true));
-            MAIN.post(this::refreshHeader);
+            MAIN.post(() -> { volBar.setEnabled(true); refreshHeader(); });
             m.subscribe("/remoteapp/mobile/#");
             refresh();
+            learn(host);
             return true;
         } catch (Exception e) {
             return false;
@@ -250,10 +308,10 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         action("platform_service", "getvolume", "");
     }
 
-    /** Finds every TV on this Wi-Fi and reads its name. Runs off the main thread. */
+    /** Finds every TV on this Wi-Fi and reads its brand, name and MAC. Runs off the main thread. */
     void discover() {
         scanning = true;
-        MAIN.post(this::refreshHeader);
+        MAIN.post(() -> { refreshHeader(); if (devicesList != null) renderDevices(); });
         List<String> hosts = new ArrayList<>();
         try {
             String prefix = localPrefix();
@@ -277,15 +335,14 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         } catch (Exception ignored) {}
         List<String[]> found = new ArrayList<>();
         for (String h : hosts) {
-            String[] info = TvDriver.identify(h);   // {brand, name, model}
+            String[] info = TvDriver.identify(h);   // {brand, name, model, mac}
             if (info == null) continue;
-            found.add(new String[]{h, info[1] != null ? info[1] : "TV at " + h, info[2], info[0]});
-            prefs.edit().putString("brand_" + h, info[0]).apply();
+            String mac = TvStore.normalMac(info[3]);
+            found.add(new String[]{h, info[1] != null ? info[1] : brandLabel(info[0]) + " TV", info[2], info[0], mac});
+            // A saved TV that moved to a new address gets its address updated.
+            TvStore.Tv saved = mac.isEmpty() ? null : store.byMac(mac);
+            if (saved != null && !saved.ip.equals(h)) { saved.ip = h; store.save(saved); }
         }
-        String cur = connectedIp;
-        boolean listed = false;
-        for (String[] d : found) if (d[0].equals(cur)) listed = true;
-        if (cur != null && !listed) found.add(0, new String[]{cur, prefs.getString("name", "Your TV"), null, prefs.getString("brand_" + cur, TvDriver.HISENSE)});
         java.util.Collections.sort(found, (a, b) -> Integer.compare(lastOctet(a[0]), lastOctet(b[0])));
         synchronized (devices) { devices.clear(); devices.addAll(found); }
         scanning = false;
@@ -296,41 +353,12 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         try { return Integer.parseInt(ip.substring(ip.lastIndexOf('.') + 1)); } catch (Exception e) { return 0; }
     }
 
-    /** {friendlyName, modelName} from the TV's media-renderer description, when it has one. */
-    String[] describe(String host) {
-        try {
-            java.net.HttpURLConnection c = (java.net.HttpURLConnection)
-                    new java.net.URL("http://" + host + ":38400/MediaServer/rendererdevicedesc.xml").openConnection();
-            c.setConnectTimeout(2000);
-            c.setReadTimeout(2500);
-            java.io.InputStream in = c.getInputStream();
-            java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
-            byte[] buf = new byte[4096]; int n;
-            while ((n = in.read(buf)) > 0) b.write(buf, 0, n);
-            in.close();
-            String xml = b.toString("UTF-8");
-            return new String[]{tag(xml, "friendlyName"), tag(xml, "modelName")};
-        } catch (Exception e) {
-            return new String[]{null, null};
-        }
-    }
-
-    static String tag(String xml, String t) {
-        int a = xml.indexOf("<" + t + ">");
-        if (a < 0) return null;
-        int b = xml.indexOf("</" + t + ">", a);
-        if (b < 0) return null;
-        String v = xml.substring(a + t.length() + 2, b).trim();
-        return v.isEmpty() ? null : v;
-    }
-
-    /** The connected TV's own name, or its model while the name is unknown. */
+    /** The current TV's name, or nothing yet. */
     String displayName() {
-        String key = connectedIp != null ? connectedIp : ip();
-        synchronized (devices) {
-            for (String[] d : devices) if (d[0].equals(key) && !d[1].startsWith("TV at")) return d[1];
-        }
-        return prefs.getString("name", "Your TV");
+        TvStore.Tv t = currentTv();
+        if (t == null) return "No TV yet";
+        if (t.name != null && !t.name.isEmpty()) return t.name;
+        return brandLabel(t.brand) + " TV";
     }
 
     void refreshHeader() {
@@ -340,72 +368,48 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             deviceBadge.setText(String.valueOf(n));
             deviceBadge.setVisibility(n > 1 ? View.VISIBLE : View.GONE);
         }
-        if (mqtt != null && connectedIp != null && statusText != null) swap(statusText, "Connected · " + connectedIp);
+        renderConnection();
     }
 
-    /** Switches to another TV from the list. */
-    void selectDevice(String[] d) {
+    /** Switches to a found TV from the list. */
+    void selectFound(String[] d) {
         buzz(this, 12);
-        if (d[0].equals(connectedIp)) return;
-        prefs.edit().putString("ip", d[0]).apply();
-        final Mqtt m = mqtt;
-        mqtt = null;
-        final TvDriver old = driver;
-        driver = null;
-        connectedIp = null;
-        if (m != null) net.execute(m::close);
-        if (old != null) net.execute(old::close);
+        userDisconnected = false;
+        closeConnection();
         swap(nowTitle, "Connecting…");
         swap(nowSub, d[1]);
-        connect();
+        setState(ST_CONNECTING, null);
+        net.execute(() -> { if (!openFound(d)) setStateBg(ST_OFFLINE, null); });
     }
 
-    /** Finds the TV on this network by its remote-control port. */
-    String scan() {
-        try {
-            String prefix = localPrefix();
-            if (prefix == null) return null;
-            final AtomicReference<String> hit = new AtomicReference<>();
-            ExecutorService pool = Executors.newFixedThreadPool(40);
-            for (int i = 1; i < 255; i++) {
-                final String host = prefix + i;
-                pool.execute(() -> {
-                    if (hit.get() != null) return;
-                    try (Socket s = new Socket()) {
-                        s.connect(new InetSocketAddress(host, PORT), 400);
-                        hit.compareAndSet(null, host);
-                    } catch (Exception ignored) {}
-                });
-            }
-            pool.shutdown();
-            pool.awaitTermination(9, TimeUnit.SECONDS);
-            return hit.get();
-        } catch (Exception e) { return null; }
+    /** Switches to a saved TV that may not have been found right now. */
+    void selectSaved(TvStore.Tv t) {
+        buzz(this, 12);
+        store.setCurrent(t.id);
+        reconnect();
     }
 
     String localPrefix() {
-        if (!ip().isEmpty()) return ip().substring(0, ip().lastIndexOf('.') + 1);
         try {
             for (java.net.NetworkInterface ni : java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())) {
                 if (!ni.isUp() || ni.isLoopback()) continue;
+                String n = ni.getName();
+                if (!n.startsWith("wlan") && !n.startsWith("eth")) continue;
                 for (java.net.InetAddress a : java.util.Collections.list(ni.getInetAddresses())) {
                     String s = a.getHostAddress();
-                    if (a instanceof java.net.Inet4Address && (s.startsWith("192.168.") || s.startsWith("10.") || s.startsWith("172.")))
-                        return s.substring(0, s.lastIndexOf('.') + 1);
+                    if (a instanceof java.net.Inet4Address) return s.substring(0, s.lastIndexOf('.') + 1);
                 }
             }
         } catch (Exception ignored) {}
         return null;
     }
 
-    @Override public void onConnected() {
-        MAIN.post(() -> setStatus(GREEN, "Connected", false));
-    }
+    @Override public void onConnected() { setStateBg(ST_CONNECTED, null); }
 
     @Override public void onDisconnected(String why) {
         mqtt = null;
         connectedIp = null;
-        MAIN.post(() -> setStatus(RED, "Disconnected · tap to reconnect", false));
+        if (!userDisconnected) setStateBg(ST_OFFLINE, null);
     }
 
     @Override public void onMessage(String topic, String payload) {
@@ -420,7 +424,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                 pairingShown = false;
                 if (new JSONObject(payload).optInt("result") == 1) {
                     toast("Paired with your TV");
-                    setStatus(GREEN, "Connected", false);
+                    setState(ST_CONNECTED, null);
                     refresh();
                 } else {
                     toast("That code didn't match. Try again.");
@@ -491,7 +495,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     void startPairing() {
         if (pairingShown) return;
         pairingShown = true;
-        setStatus(AMBER, "Pairing", true);
+        setState(ST_PAIRING, "Type the 4-digit code shown on the TV");
         try {
             JSONObject o = new JSONObject();
             o.put("app_version", 2); o.put("connect_result", 0); o.put("device_type", "Mobile App");
@@ -522,7 +526,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                 })
                 .setNegativeButton("Not now", (x, w) -> {
                     pairingShown = false;
-                    setStatus(RED, "Not paired · tap to retry", false);
+                    disconnectNow();
+                    setState(ST_DISCONNECTED, "Not paired. Tap Connect to try again.");
                 })
                 .create();
         d.show();
@@ -568,21 +573,14 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     void notConnected() {
         if (System.currentTimeMillis() - lastNotConnected < 2000) return;
         lastNotConnected = System.currentTimeMillis();
-        toast("Not connected to the TV");
+        toast(connState == ST_CONNECTING || connState == ST_SEARCHING ? "Still connecting…" : "Not connected. Use the buttons at the top to connect.");
     }
 
     void power() {
         buzz(this, 25);
         if (driver != null && driver.isConnected()) { driver.key("KEY_POWER"); return; }
         if (mqtt != null) { key("KEY_POWER"); return; }
-        String mac = prefs.getString("mac", "");
-        if (mac.isEmpty()) { askMac(); return; }
-        setStatus(AMBER, "Waking the TV", true);
-        new Thread(() -> {
-            wakeOnLan(mac);
-            try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
-            MAIN.post(this::connect);
-        }).start();
+        wake();
     }
 
     void wakeOnLan(String mac) {
@@ -740,44 +738,103 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     void renderDevices() {
         if (devicesList == null) return;
-        devicesSub.setText(scanning ? "Searching this Wi-Fi…" : devices.size() + " found on this Wi-Fi");
+        devicesSub.setText(scanning ? "Searching this Wi-Fi…" : devices.size() + " found on this Wi-Fi right now");
         devicesList.removeAllViews();
-        List<String[]> list;
-        synchronized (devices) { list = new ArrayList<>(devices); }
-        if (list.isEmpty()) {
+        List<String[]> found;
+        synchronized (devices) { found = new ArrayList<>(devices); }
+        List<TvStore.Tv> saved = store.all();
+        TvStore.Tv cur = currentTv();
+
+        // Saved TVs (remembered even when off), each marked found / not found.
+        if (!saved.isEmpty()) {
+            devicesList.addView(sectionTitle("Your TVs"));
+            for (final TvStore.Tv t : saved) {
+                String[] here = null;
+                for (String[] d : found) {
+                    if ((!t.mac.isEmpty() && t.mac.equals(d[4])) || (t.mac.isEmpty() && d[0].equals(t.ip))) here = d;
+                }
+                boolean isCurrent = cur != null && cur.id.equals(t.id);
+                boolean connected = isCurrent && connState == ST_CONNECTED;
+                String state = connected ? "Connected" : here != null ? "On · " + here[0] : scanning ? "Checking…" : "Not found";
+                String sub = brandLabel(t.brand) + (t.model != null && !t.model.isEmpty() ? " · " + t.model : "")
+                        + (t.canWake() ? "" : " · can't be turned on yet");
+                final String[] foundNow = here;
+                deviceRow(t.name != null && !t.name.isEmpty() ? t.name : brandLabel(t.brand) + " TV", sub, state, connected,
+                        () -> { if (foundNow != null) selectFound(foundNow); else selectSaved(t); renderDevices(); },
+                        () -> confirmForget(t));
+            }
+        }
+
+        // TVs found now that aren't saved yet.
+        List<String[]> fresh = new ArrayList<>();
+        for (String[] d : found) {
+            boolean known = false;
+            for (TvStore.Tv t : saved) if ((!t.mac.isEmpty() && t.mac.equals(d[4])) || (t.mac.isEmpty() && t.ip.equals(d[0]))) known = true;
+            if (!known) fresh.add(d);
+        }
+        if (!fresh.isEmpty()) {
+            devicesList.addView(sectionTitle(saved.isEmpty() ? "Found on this Wi-Fi" : "Other TVs found"));
+            for (final String[] d : fresh) {
+                deviceRow(d[1], brandLabel(d[3]) + (d[2] != null ? " · " + d[2] : "") + " · " + d[0], "Connect", false,
+                        () -> { selectFound(d); renderDevices(); }, null);
+            }
+        }
+        if (saved.isEmpty() && fresh.isEmpty()) {
             TextView empty = text(this, scanning ? "Looking for TVs…"
                     : "No TVs found. Turn the TV on, keep this phone on the same Wi-Fi, then tap ↻.", 14, SUB, 400);
             empty.setGravity(Gravity.CENTER);
             empty.setPadding(dp(this, 10), dp(this, 30), dp(this, 10), dp(this, 30));
             devicesList.addView(empty);
-            return;
         }
-        for (final String[] d : list) {
-            boolean connected = d[0].equals(connectedIp);
-            LinearLayout r = row();
-            r.setPadding(dp(this, 12), dp(this, 12), dp(this, 12), dp(this, 12));
-            r.setBackground(ripple(shape(SURFACE, dp(this, 18), STROKE, this)));
-            FrameLayout ic = new FrameLayout(this);
-            ic.setBackground(connected ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 12)) : shape(SURFACE2, dp(this, 12), 0, this));
-            ic.addView(new Icon(this, Icon.TV, connected ? Color.WHITE : SUB),
-                    new FrameLayout.LayoutParams(dp(this, 22), dp(this, 22), Gravity.CENTER));
-            r.addView(ic, new LinearLayout.LayoutParams(dp(this, 46), dp(this, 46)));
-            LinearLayout t = new LinearLayout(this);
-            t.setOrientation(LinearLayout.VERTICAL);
-            t.setPadding(dp(this, 14), 0, dp(this, 8), 0);
-            t.addView(text(this, d[1], 16, TEXT, 500));
-            TextView sub = text(this, brandLabel(d[3]) + " · " + (d[2] != null ? d[2] + " · " : "") + d[0], 12, SUB, 400);
-            t.addView(sub, margins(-2, -2, 0, 4));
-            r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
-            TextView state = text(this, connected ? "Connected" : "Connect", 12, connected ? GREEN : CRIMSON, 500);
-            state.setPadding(dp(this, 10), dp(this, 6), dp(this, 10), dp(this, 6));
-            state.setBackground(shape(((connected ? GREEN : CRIMSON) & 0x00FFFFFF) | 0x22000000, dp(this, 14), 0, this));
-            r.addView(state);
-            press(r, () -> { selectDevice(d); renderDevices(); }, false);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-            lp.bottomMargin = dp(this, 10);
-            devicesList.addView(r, lp);
+    }
+
+    void deviceRow(String name, String sub, String state, boolean connected, Runnable onTap, Runnable onForget) {
+        LinearLayout r = row();
+        r.setPadding(dp(this, 12), dp(this, 12), dp(this, 12), dp(this, 12));
+        r.setBackground(ripple(shape(SURFACE, dp(this, 18), STROKE, this)));
+        FrameLayout ic = new FrameLayout(this);
+        ic.setBackground(connected ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 12)) : shape(SURFACE2, dp(this, 12), 0, this));
+        ic.addView(new Icon(this, Icon.TV, connected ? Color.WHITE : SUB), new FrameLayout.LayoutParams(dp(this, 22), dp(this, 22), Gravity.CENTER));
+        r.addView(ic, new LinearLayout.LayoutParams(dp(this, 46), dp(this, 46)));
+        LinearLayout t = new LinearLayout(this);
+        t.setOrientation(LinearLayout.VERTICAL);
+        t.setPadding(dp(this, 14), 0, dp(this, 8), 0);
+        t.addView(text(this, name, 16, TEXT, 500));
+        t.addView(text(this, sub, 12, SUB, 400), margins(-2, -2, 0, 4));
+        r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+        int c = connected ? GREEN : state.startsWith("On") || state.equals("Connect") ? CRIMSON : FAINT;
+        TextView st = text(this, state, 12, c, 500);
+        st.setPadding(dp(this, 10), dp(this, 6), dp(this, 10), dp(this, 6));
+        st.setBackground(shape((c & 0x00FFFFFF) | 0x22000000, dp(this, 14), 0, this));
+        r.addView(st);
+        if (onForget != null) {
+            TextView x = text(this, "✕", 14, FAINT, 500);
+            x.setGravity(Gravity.CENTER);
+            x.setContentDescription("Forget this TV");
+            press(x, onForget, false);
+            LinearLayout.LayoutParams xl = new LinearLayout.LayoutParams(dp(this, 34), dp(this, 34));
+            xl.leftMargin = dp(this, 6);
+            r.addView(x, xl);
         }
+        press(r, onTap, false);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.bottomMargin = dp(this, 10);
+        devicesList.addView(r, lp);
+    }
+
+    void confirmForget(TvStore.Tv t) {
+        new AlertDialog.Builder(this, Ui.dialogTheme())
+                .setTitle("Forget " + (t.name != null && !t.name.isEmpty() ? t.name : "this TV") + "?")
+                .setMessage("Crimson will remove its saved address, MAC and pairing. You can add it again by connecting.")
+                .setPositiveButton("Forget", (d, w) -> {
+                    TvStore.Tv cur = currentTv();
+                    if (cur != null && cur.id.equals(t.id)) disconnectNow();
+                    store.forget(t.id);
+                    renderDevices();
+                    refreshHeader();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     // ---------------------------------------------------------------- settings
@@ -800,11 +857,19 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         devRow.addView(dt, new LinearLayout.LayoutParams(0, -2, 1));
         devRow.addView(text(this, devices.size() + " found  ›", 12, FAINT, 400));
         tvg.addView(devRow);
-        final EditText ipBox = field("TV address (found automatically)", ip(), InputType.TYPE_CLASS_PHONE);
-        final EditText macBox = field("TV MAC address, for power-on", prefs.getString("mac", ""), InputType.TYPE_CLASS_TEXT);
+        TvStore.Tv curTv = currentTv();
+        if (curTv != null) {
+            TextView facts = text(this, "Saved: " + brandLabel(curTv.brand) + " · " + curTv.ip
+                    + (curTv.canWake() ? " · MAC " + curTv.mac : " · MAC not known yet"), 12, SUB, 400);
+            facts.setPadding(dp(this, 14), 0, dp(this, 14), dp(this, 10));
+            tvg.addView(facts);
+        }
+        TextView addHint = text(this, "Add a TV by address (only if it isn't found automatically)", 12, FAINT, 400);
+        addHint.setPadding(dp(this, 14), dp(this, 4), dp(this, 14), 0);
+        tvg.addView(addHint);
+        final EditText ipBox = field("e.g. 192.168.1.20", "", InputType.TYPE_CLASS_PHONE);
         tvg.addView(ipBox);
-        tvg.addView(macBox);
-        TextView save = text(this, "Save TV details", 14, Color.WHITE, 500);
+        TextView save = text(this, "Add and connect", 14, Color.WHITE, 500);
         save.setGravity(Gravity.CENTER);
         save.setBackground(ripple(gradient(CRIMSON, CRIMSON_DARK, dp(this, 22))));
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-1, dp(this, 44));
@@ -900,12 +965,18 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         final android.app.Dialog d = sheet(c);
         press(devRow, () -> { d.dismiss(); devicesSheet(); }, false);
         press(save, () -> {
-            prefs.edit().putString("ip", ipBox.getText().toString().trim())
-                    .putString("mac", macBox.getText().toString().trim().toUpperCase()).apply();
-            if (mqtt != null) { mqtt.close(); mqtt = null; }
+            final String host = ipBox.getText().toString().trim();
+            if (!host.matches("\\d{1,3}(\\.\\d{1,3}){3}")) { toast("Type an address like 192.168.1.20"); return; }
             d.dismiss();
-            toast("Saved");
-            connect();
+            setState(ST_CONNECTING, null);
+            net.execute(() -> {
+                String[] info = TvDriver.identify(host);
+                if (info == null) { setStateBg(ST_OFFLINE, null); MAIN.post(() -> toast("No supported TV answered at " + host)); return; }
+                userDisconnected = false;
+                closeConnection();
+                if (!openFound(new String[]{host, info[1] != null ? info[1] : brandLabel(info[0]) + " TV", info[2], info[0], TvStore.normalMac(info[3])}))
+                    setStateBg(ST_OFFLINE, null);
+            });
         }, false);
     }
 
@@ -965,10 +1036,6 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         return f;
     }
 
-    void askMac() {
-        toast("Add the TV's MAC address to turn it on from the phone");
-        settings();
-    }
 
     // ================================================================ layout
 
@@ -1041,7 +1108,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         TextView brand = text(this, "CRIMSON", 12, CRIMSON, 700);
         brand.setLetterSpacing(0.32f);
         left.addView(brand);
-        title = text(this, prefs.getString("name", "Your TV") + "  ▾", 24, TEXT, 700);
+        title = text(this, "No TV yet  ▾", 24, TEXT, 700);
         title.setPadding(0, dp(this, 6), 0, 0);
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -1074,19 +1141,28 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         wrap.setOrientation(LinearLayout.VERTICAL);
         wrap.addView(h);
 
-        LinearLayout pill = new LinearLayout(this);
-        pill.setOrientation(LinearLayout.HORIZONTAL);
-        pill.setGravity(Gravity.CENTER_VERTICAL);
-        pill.setPadding(dp(this, 10), dp(this, 6), dp(this, 12), dp(this, 6));
-        pill.setBackground(ripple(shape(SURFACE, dp(this, 16), STROKE, this)));
+        // Connection card: what is happening right now, and the buttons to change it.
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(this, 14), dp(this, 12), dp(this, 14), dp(this, 12));
+        card.setBackground(shape(SURFACE, dp(this, 18), STROKE, this));
+        card.setLayoutTransition(new LayoutTransition());
+        LinearLayout line = row();
         statusDot = new View(this);
-        statusDot.setBackground(shape(AMBER, dp(this, 4), 0, this));
-        pill.addView(statusDot, new LinearLayout.LayoutParams(dp(this, 8), dp(this, 8)));
-        statusText = text(this, "Connecting", 12, SUB, 500);
-        statusText.setPadding(dp(this, 8), 0, 0, 0);
-        pill.addView(statusText);
-        pill.setOnClickListener(v -> { if (mqtt == null) connect(); else devicesSheet(); });
-        wrap.addView(pill, margins(-2, -2, 0, 10));
+        statusDot.setBackground(shape(AMBER, dp(this, 5), 0, this));
+        line.addView(statusDot, new LinearLayout.LayoutParams(dp(this, 10), dp(this, 10)));
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        texts.setPadding(dp(this, 10), 0, 0, 0);
+        statusText = text(this, "Starting", 14, TEXT, 500);
+        texts.addView(statusText);
+        statusDetail = text(this, "", 12, SUB, 400);
+        texts.addView(statusDetail, margins(-2, -2, 0, 2));
+        line.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
+        card.addView(line);
+        connButtons = row();
+        card.addView(connButtons, margins(-1, -2, 0, 10));
+        wrap.addView(card, margins(-1, -2, 0, 12));
         return wrap;
     }
 
@@ -1496,7 +1572,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         super.onActivityResult(req, res, data);
         if (req != PICK_MEDIA || res != RESULT_OK || data == null || data.getData() == null) return;
         final android.net.Uri uri = data.getData();
-        final String tv = connectedIp != null ? connectedIp : ip();
+        final String tv = connectedIp != null ? connectedIp : currentTv() != null ? currentTv().ip : "";
         if (tv.isEmpty()) { toast("Connect to a TV first"); return; }
         if (caster == null) caster = new Caster(this);
         castStatus.setText("Sending to the TV…");
@@ -1607,17 +1683,11 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     void renderApps(JSONArray list) {
         appsRow.removeAllViews();
-        if (list == null) {
-            list = new JSONArray();
-            String[][] d = {{"YouTube", "youtube", "3"}, {"Netflix", "netflix", "1"}, {"Prime Video", "amazon", ""}};
-            for (String[] a : d) {
-                try {
-                    JSONObject o = new JSONObject();
-                    o.put("name", a[0]); o.put("url", a[1]); o.put("appId", a[2]);
-                    o.put("urlType", 37); o.put("storeType", 0);
-                    list.put(o);
-                } catch (Exception ignored) {}
-            }
+        if (list == null || list.length() == 0) {
+            TextView empty = text(this, "Your TV's apps show here once it's connected.", 13, FAINT, 400);
+            empty.setPadding(dp(this, 4), dp(this, 8), 0, dp(this, 8));
+            appsRow.addView(empty);
+            return;
         }
         int[] tints = {0xFFE11D48, 0xFFF97316, 0xFF8B5CF6, 0xFF06B6D4, 0xFF22C55E, 0xFFEAB308, 0xFF3B82F6, 0xFFEC4899};
         for (int i = 0; i < list.length() && i < 16; i++) {
@@ -1763,12 +1833,107 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     // ================================================================ helpers
 
-    void setStatus(int color, String msg, boolean busy) {
+    TextView statusDetail;
+    LinearLayout connButtons;
+    String stateNote;
+
+    void setState(int st, String note) {
+        connState = st;
+        stateNote = note;
+        renderConnection();
+    }
+
+    void setStateBg(int st, String note) { MAIN.post(() -> setState(st, note)); }
+
+    /** Draws the connection card for the current state, with only the buttons that make sense. */
+    void renderConnection() {
         if (statusDot == null) return;
-        statusDot.setBackground(shape(color, dp(this, 4), 0, this));
+        TvStore.Tv tv = currentTv();
+        String name = tv != null ? displayName() : null;
+        int color; String head, detail; boolean busy = false;
+        switch (connState) {
+            case ST_CONNECTED:
+                color = GREEN; head = "Connected";
+                detail = (tv != null ? brandLabel(tv.brand) + " · " : "") + (connectedIp != null ? connectedIp : "");
+                break;
+            case ST_CONNECTING: color = AMBER; busy = true; head = "Connecting to " + (name != null ? name : "the TV"); detail = tv != null ? tv.ip : ""; break;
+            case ST_SEARCHING: color = AMBER; busy = true; head = "Looking for TVs on this Wi-Fi"; detail = "This takes a few seconds"; break;
+            case ST_WAKING: color = AMBER; busy = true; head = "Waking " + (name != null ? name : "the TV"); detail = "Sent the wake-up signal"; break;
+            case ST_PAIRING: color = AMBER; busy = true; head = "Waiting for the TV"; detail = stateNote != null ? stateNote : "Approve Crimson on the TV"; break;
+            case ST_DISCONNECTED: color = FAINT; head = "Disconnected"; detail = stateNote != null ? stateNote : "Tap Connect when you want to use the TV"; break;
+            case ST_NONE: color = RED; head = "No TVs found"; detail = "Turn a TV on and keep this phone on the same Wi-Fi"; break;
+            case ST_CHOOSE: color = AMBER; head = devices.size() + " TVs found"; detail = "Choose which one to use"; break;
+            case ST_OFFLINE:
+                color = RED; head = (name != null ? name : "The TV") + " isn't answering";
+                detail = tv != null && tv.canWake() ? "It may be off. Tap Turn on." : "It may be off, or on another Wi-Fi";
+                break;
+            default: color = FAINT; head = "Starting"; detail = "";
+        }
+        statusDot.setBackground(shape(color, dp(this, 5), 0, this));
         if (pulse != null) { pulse.cancel(); pulse = null; statusDot.setAlpha(1f); }
         if (busy) pulse = Ui.pulse(statusDot);
-        swap(statusText, msg);
+        swap(statusText, head);
+        statusDetail.setText(detail);
+        statusDetail.setVisibility(detail.isEmpty() ? View.GONE : View.VISIBLE);
+
+        connButtons.removeAllViews();
+        switch (connState) {
+            case ST_CONNECTED:
+                connButton("Disconnect", false, this::disconnectNow);
+                connButton("Switch TV", false, this::devicesSheet);
+                break;
+            case ST_CONNECTING: case ST_SEARCHING: case ST_WAKING: case ST_PAIRING:
+                connButton("Stop", false, this::disconnectNow);
+                if (connState == ST_PAIRING) connButton("Try again", true, this::reconnect);
+                break;
+            case ST_OFFLINE:
+                if (tv != null && tv.canWake()) connButton("Turn on", true, this::wake);
+                connButton("Reconnect", tv == null || !tv.canWake(), this::reconnect);
+                connButton("Switch TV", false, this::devicesSheet);
+                break;
+            case ST_CHOOSE:
+                connButton("Choose TV", true, this::devicesSheet);
+                connButton("Search again", false, this::reconnect);
+                break;
+            case ST_NONE:
+                connButton("Search again", true, this::reconnect);
+                connButton("Add by address", false, this::settings);
+                break;
+            default:
+                connButton("Connect", true, this::reconnect);
+                if (tv != null && tv.canWake()) connButton("Turn on", false, this::wake);
+                connButton("Switch TV", false, this::devicesSheet);
+        }
+        boolean live = connState == ST_CONNECTED;
+        if (pages != null) pages.animate().alpha(live ? 1f : 0.45f).setDuration(200).start();
+    }
+
+    void connButton(String label, boolean primary, Runnable r) {
+        TextView b = text(this, label, 13, primary ? Color.WHITE : TEXT, 500);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(this, 12), 0, dp(this, 12), 0);
+        b.setBackground(ripple(primary ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 18)) : shape(SURFACE2, dp(this, 18), STROKE, this)));
+        press(b, r, false);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(this, 38), 1);
+        lp.rightMargin = dp(this, 8);
+        connButtons.addView(b, lp);
+    }
+
+    /** Sends the wake-up signal to the saved TV, then reconnects. */
+    void wake() {
+        final TvStore.Tv tv = currentTv();
+        if (tv == null || !tv.canWake()) { toast("Connect to this TV once while it's on, then Crimson can turn it on"); return; }
+        buzz(this, 25);
+        userDisconnected = false;
+        setState(ST_WAKING, null);
+        new Thread(() -> {
+            for (int i = 0; i < 3; i++) { wakeOnLan(tv.mac); try { Thread.sleep(700); } catch (InterruptedException ignored) {} }
+            for (int i = 0; i < 10 && !isConnected(); i++) {
+                try { Thread.sleep(2500); } catch (InterruptedException ignored) {}
+                if (open(tv)) return;
+            }
+            if (!isConnected()) setStateBg(ST_OFFLINE, null);
+        }).start();
     }
 
     void swap(TextView t, String s) { if (t != null) swapText(t, s); }

@@ -42,17 +42,22 @@ public abstract class TvDriver {
         /** [{sourceid, displayname, sourcename, is_signal}] */
         void onSources(JSONArray sources);
         void onModel(String model);
+        /** The TV's MAC address, learned while connecting, so it can be woken later. */
+        void onMac(String mac);
     }
 
     static final Charset UTF8 = Charset.forName("UTF-8");
     protected final Context ctx;
     protected final String ip;
+    /** The saved TV's id, used to keep its pairing token even if its address changes. */
+    protected final String id;
     protected final Listener l;
     protected final SharedPreferences prefs;
 
-    TvDriver(Context c, String ip, Listener l) {
+    TvDriver(Context c, String ip, String id, Listener l) {
         this.ctx = c.getApplicationContext();
         this.ip = ip;
+        this.id = id;
         this.l = l;
         this.prefs = ctx.getSharedPreferences("crimson", Context.MODE_PRIVATE);
     }
@@ -74,11 +79,11 @@ public abstract class TvDriver {
     public void pointer(float dx, float dy) {}
     public void click() {}
 
-    public static TvDriver create(Context c, String brand, String ip, Listener l) {
+    public static TvDriver create(Context c, String brand, String ip, String id, Listener l) {
         switch (brand) {
-            case ROKU: return new Roku(c, ip, l);
-            case SAMSUNG: return new Samsung(c, ip, l);
-            case LG: return new Lg(c, ip, l);
+            case ROKU: return new Roku(c, ip, id, l);
+            case SAMSUNG: return new Samsung(c, ip, id, l);
+            case LG: return new Lg(c, ip, id, l);
             default: return null;
         }
     }
@@ -98,18 +103,23 @@ public abstract class TvDriver {
         }
     }
 
-    /** {brand, name, model} for a host, or null if it isn't a TV this app knows. */
+    /** {brand, name, model, mac} for a host, or null if it isn't a TV this app knows. */
     public static String[] identify(String host) {
         if (open(host, 36669, 500)) {
             String xml = get("http://" + host + ":38400/MediaServer/rendererdevicedesc.xml", 2500);
-            return new String[]{HISENSE, tag(xml, "friendlyName"), tag(xml, "modelName")};
+            // Hisense lists "mac=…" and "model_name=…" inside modelDescription.
+            String desc = tag(xml, "modelDescription");
+            String model = field(desc, "model_name");
+            if (model != null) model = model.split("_")[0];
+            return new String[]{HISENSE, tag(xml, "friendlyName"), model, field(desc, "mac")};
         }
         if (open(host, 8060, 500)) {
             String xml = get("http://" + host + ":8060/query/device-info", 2500);
             if (xml != null && xml.contains("<device-info")) {
                 String name = tag(xml, "user-device-name");
                 if (name == null) name = tag(xml, "friendly-device-name");
-                return new String[]{ROKU, name != null ? name : "Roku", tag(xml, "model-name")};
+                String mac = "ethernet".equals(tag(xml, "network-type")) ? tag(xml, "ethernet-mac") : tag(xml, "wifi-mac");
+                return new String[]{ROKU, name != null ? name : "Roku", tag(xml, "model-name"), mac};
             }
         }
         if (open(host, 8001, 500) || open(host, 8002, 500)) {
@@ -117,12 +127,13 @@ public abstract class TvDriver {
             if (js != null && js.contains("\"device\"")) {
                 try {
                     JSONObject d = new JSONObject(js).getJSONObject("device");
-                    return new String[]{SAMSUNG, d.optString("name", "Samsung TV").replace("[TV] ", ""), d.optString("modelName", null)};
+                    return new String[]{SAMSUNG, d.optString("name", "Samsung TV").replace("[TV] ", ""),
+                            d.optString("modelName", null), d.optString("wifiMac", null)};
                 } catch (Exception ignored) {}
             }
         }
         if (open(host, 3000, 500) || open(host, 3001, 500)) {
-            return new String[]{LG, "LG TV", null};
+            return new String[]{LG, "LG TV", null, null};
         }
         return null;
     }
@@ -177,6 +188,16 @@ public abstract class TvDriver {
 
     static void bg(Runnable r) { new Thread(r).start(); }
 
+    /** "key=value" lines, as in Hisense's modelDescription. */
+    static String field(String text, String key) {
+        if (text == null) return null;
+        for (String line : text.split("[\\r\\n]+")) {
+            line = line.trim();
+            if (line.startsWith(key + "=")) return line.substring(key.length() + 1).trim();
+        }
+        return null;
+    }
+
     /** Single printable character from a Lit_ code, or null for a special code. */
     static String litChar(String code) {
         String v = code.substring(4);
@@ -201,7 +222,7 @@ public abstract class TvDriver {
             for (String[] p : m) KEYS.put(p[0], p[1]);
         }
 
-        Roku(Context c, String ip, Listener l) { super(c, ip, l); }
+        Roku(Context c, String ip, String id, Listener l) { super(c, ip, id, l); }
 
         String base() { return "http://" + ip + ":8060"; }
 
@@ -211,6 +232,8 @@ public abstract class TvDriver {
             up = true;
             String model = tag(info, "model-name");
             String name = tag(info, "user-device-name");
+            String mac = "ethernet".equals(tag(info, "network-type")) ? tag(info, "ethernet-mac") : tag(info, "wifi-mac");
+            if (mac != null) l.onMac(mac);
             l.onModel("Roku " + (model != null ? model : ""));
             l.onConnected();
             if ("true".equals(tag(info, "is-tv"))) {
@@ -315,11 +338,11 @@ public abstract class TvDriver {
             for (String[] p : m) KEYS.put(p[0], p[1]);
         }
 
-        Samsung(Context c, String ip, Listener l) { super(c, ip, l); }
+        Samsung(Context c, String ip, String id, Listener l) { super(c, ip, id, l); }
 
         @Override public boolean connect() {
             String name = Base64.encodeToString("Crimson Remote".getBytes(UTF8), Base64.NO_WRAP);
-            String token = prefs.getString("samsung_token_" + ip, "");
+            String token = prefs.getString("samsung_token_" + id, "");
             String[] urls = {
                     "wss://" + ip + ":8002/api/v2/channels/samsung.remote.control?name=" + name + (token.isEmpty() ? "" : "&token=" + token),
                     "ws://" + ip + ":8001/api/v2/channels/samsung.remote.control?name=" + name};
@@ -335,7 +358,7 @@ public abstract class TvDriver {
                         JSONObject d = new JSONObject(js).getJSONObject("device");
                         l.onModel("Samsung " + d.optString("modelName", ""));
                         String mac = d.optString("wifiMac", "");
-                        if (!mac.isEmpty() && prefs.getString("mac", "").isEmpty()) prefs.edit().putString("mac", mac.toUpperCase()).apply();
+                        if (!mac.isEmpty()) l.onMac(mac);
                     } catch (Exception ignored) {}
                     return true;
                 } catch (IOException ignored) {}
@@ -349,7 +372,7 @@ public abstract class TvDriver {
                 String ev = o.optString("event");
                 if (ev.equals("ms.channel.connect")) {
                     JSONObject d = o.optJSONObject("data");
-                    if (d != null && d.has("token")) prefs.edit().putString("samsung_token_" + ip, d.getString("token")).apply();
+                    if (d != null && d.has("token")) prefs.edit().putString("samsung_token_" + id, d.getString("token")).apply();
                     ready = true;
                     l.onConnected();
                     l.onState("Samsung TV", "Connected");
@@ -440,7 +463,7 @@ public abstract class TvDriver {
             for (int i = 0; i <= 9; i++) BUTTONS.put("KEY_" + i, String.valueOf(i));
         }
 
-        Lg(Context c, String ip, Listener l) { super(c, ip, l); }
+        Lg(Context c, String ip, String id, Listener l) { super(c, ip, id, l); }
 
         @Override public boolean connect() {
             String[] urls = {"wss://" + ip + ":3001/", "ws://" + ip + ":3000/"};
@@ -460,7 +483,7 @@ public abstract class TvDriver {
         private void register() throws IOException {
             try {
                 JSONObject payload = new JSONObject(TvDriver.read(ctx.getAssets().open("lg_manifest.json")));
-                String key = prefs.getString("lg_key_" + ip, "");
+                String key = prefs.getString("lg_key_" + id, "");
                 if (!key.isEmpty()) payload.put("client-key", key);
                 else l.onPrompt("Tap Accept on the TV to let Crimson control it");
                 ws.send(new JSONObject().put("type", "register").put("id", "register_0").put("payload", payload).toString());
@@ -497,7 +520,7 @@ public abstract class TvDriver {
                 JSONObject p = o.optJSONObject("payload");
                 if (id.equals("register_0")) {
                     if (type.equals("registered")) {
-                        if (p != null && p.has("client-key")) prefs.edit().putString("lg_key_" + ip, p.getString("client-key")).apply();
+                        if (p != null && p.has("client-key")) prefs.edit().putString("lg_key_" + id, p.getString("client-key")).apply();
                         registered = true;
                         l.onConnected();
                         afterRegister();
@@ -549,6 +572,13 @@ public abstract class TvDriver {
                     case "info":
                         l.onModel("LG " + p.optString("modelName", ""));
                         break;
+                    case "net": {
+                        JSONObject wired = p.optJSONObject("wiredInfo"), wifi = p.optJSONObject("wifiInfo");
+                        String mac = wired != null && "connected".equals(wired.optString("state")) ? wired.optString("macAddress")
+                                : wifi != null ? wifi.optString("macAddress") : "";
+                        if (!mac.isEmpty()) l.onMac(mac);
+                        break;
+                    }
                     case "pointer": {
                         String path = p.optString("socketPath", "");
                         if (!path.isEmpty()) bg(() -> { try { pointerWs.connect(path, new WsClient.Listener() {
@@ -569,6 +599,7 @@ public abstract class TvDriver {
         private void afterRegister() {
             request("ssap://com.webos.service.networkinput/getPointerInputSocket", null, "pointer");
             request("ssap://system/getSystemInfo", null, "info");
+            request("ssap://com.webos.service.connectionmanager/getinfo", null, "net");
             subscribe("ssap://audio/getVolume", "volume");
             subscribe("ssap://com.webos.applicationManager/getForegroundAppInfo", "fg");
             refresh();

@@ -59,7 +59,8 @@ public class Bridge implements Mqtt.Listener {
         }
         cid = id;
         put("status", "connecting");
-        put("model", prefs.getString("name", null));
+        TvStore.Tv cur = new TvStore(ctx).current();
+        put("model", cur != null ? cur.name : null);
         put("pairing", false);
     }
 
@@ -99,12 +100,12 @@ public class Bridge implements Mqtt.Listener {
         while (running) {
             Mqtt m = mqtt;
             if (m == null || !m.isConnected()) {
-                String host = prefs.getString("ip", "");
+                TvStore.Tv cur = new TvStore(ctx).current();
+                String host = cur != null && TvDriver.HISENSE.equals(cur.brand) ? cur.ip : "";
                 boolean ok = !host.isEmpty() && tryConnect(host);
                 if (!ok) {
                     String found = scan();
                     if (found != null) {
-                        prefs.edit().putString("ip", found).apply();
                         ok = tryConnect(found);
                     }
                 }
@@ -185,9 +186,11 @@ public class Bridge implements Mqtt.Listener {
         } catch (IOException ignored) {}
     }
 
-    private void wake() throws IOException {
-        String mac = prefs.getString("mac", "");
-        if (mac.isEmpty()) throw new IOException("Add the TV's MAC address in settings first");
+    private void wake(String requested) throws IOException {
+        TvStore.Tv cur = new TvStore(ctx).current();
+        String mac = TvStore.normalMac(requested);
+        if (mac.isEmpty() && cur != null) mac = cur.mac;
+        if (mac == null || mac.isEmpty()) throw new IOException("This TV's MAC address isn't known yet");
         String[] h = mac.split("[:-]");
         byte[] m = new byte[6];
         for (int i = 0; i < 6; i++) m[i] = (byte) Integer.parseInt(h[i], 16);
@@ -205,7 +208,8 @@ public class Bridge implements Mqtt.Listener {
     }
 
     private String scan() {
-        String base = prefs.getString("ip", "");
+        TvStore.Tv cur = new TvStore(ctx).current();
+        String base = cur != null ? cur.ip : "";
         String prefix = !base.isEmpty() ? base.substring(0, base.lastIndexOf('.') + 1) : null;
         if (prefix == null) {
             String ip = localIp();
@@ -377,13 +381,9 @@ public class Bridge implements Mqtt.Listener {
                         .put("storeType", b.optInt("storeType", 0)).toString());
                 break;
             case "/api/pair": pub("ui_service", "authenticationcode", new JSONObject().put("authNum", b.getString("code")).toString()); break;
-            case "/api/wake": wake(); break;
+            case "/api/wake": wake(b.optString("mac", "")); break;
             case "/api/refresh": refresh(); break;
             case "/api/settings": {
-                SharedPreferences.Editor e = prefs.edit();
-                if (b.has("ip")) e.putString("ip", b.getString("ip").trim());
-                if (b.has("mac")) e.putString("mac", b.getString("mac").trim().toUpperCase());
-                e.apply();
                 Mqtt m = mqtt; mqtt = null;
                 if (m != null) m.close();
                 break;
