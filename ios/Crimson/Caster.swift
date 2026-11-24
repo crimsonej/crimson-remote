@@ -360,6 +360,11 @@ struct CastScreen: View {
 
                     if caster.phase != .idle { nowCasting }
 
+                    if !tv.features.isEmpty && !tv.features.contains(.cast) {
+                        Text("This TV doesn't accept photos and videos from phones. Use AirPlay or Crimson Desktop below if it supports them.")
+                            .font(.system(size: 13)).foregroundStyle(Theme.sub)
+                            .padding(16).frame(maxWidth: .infinity, alignment: .leading).card(radius: 20)
+                    } else {
                     PhotosPicker(selection: $item, matching: .any(of: [.images, .videos])) {
                         HStack(spacing: 16) {
                             Image(systemName: "photo.on.rectangle.angled")
@@ -380,6 +385,7 @@ struct CastScreen: View {
                     .buttonStyle(PressStyle(scale: 0.98))
                     .disabled(caster.phase == .preparing || caster.phase == .sending || tv.status != .connected)
                     .opacity(tv.status == .connected ? 1 : 0.5)
+                    }
 
                     Text("MORE WAYS").sectionLabel().padding(.top, 4)
                     VStack(spacing: 0) {

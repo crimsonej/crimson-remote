@@ -2,12 +2,13 @@ import SwiftUI
 
 /// One place decides which sheet is up, so every button that opens one works.
 enum ActiveSheet: String, Identifiable {
-    case settings, devices, inputs, pairing, keyboard, more
+    case settings, devices, inputs, pairing, keyboard, more, speaker, about
     var id: String { rawValue }
 }
 
 final class SheetRouter: ObservableObject {
     @Published var sheet: ActiveSheet?
+    @Published var tab = 0
 }
 
 struct ContentView: View {
@@ -17,12 +18,11 @@ struct ContentView: View {
     @AppStorage("accent") private var accent = Accent.crimson.rawValue
     @AppStorage("style") private var style = ThemeStyle.glow.rawValue
     @StateObject private var router = SheetRouter()
-    @State private var tab = 0
     @State private var splash = true
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            TabView(selection: $tab) {
+            TabView(selection: $router.tab) {
                 RemoteScreen()
                     .tabItem { Label("Remote", systemImage: "av.remote") }
                     .tag(0)
@@ -32,6 +32,9 @@ struct ContentView: View {
                 CastScreen()
                     .tabItem { Label("Cast", systemImage: "play.tv.fill") }
                     .tag(2)
+                DiscoverScreen()
+                    .tabItem { Label("TVs", systemImage: "tv.and.mediabox") }
+                    .tag(3)
             }
             .tint(Theme.crimson)
 
@@ -56,7 +59,7 @@ struct ContentView: View {
         .preferredColorScheme(Appearance(rawValue: appearance)?.scheme)
         .onAppear {
             tv.connect()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
                 withAnimation(.easeInOut(duration: 0.45)) { splash = false }
             }
         }
@@ -64,7 +67,7 @@ struct ContentView: View {
             if p == .active { tv.connect() } else if p == .background { tv.disconnect() }
         }
         .onChange(of: tv.chooseTV) { choose in
-            if choose { router.sheet = .devices; tv.chooseTV = false }
+            if choose { router.tab = 3; tv.chooseTV = false }
         }
         .onChange(of: tv.showPairing) { show in
             if show { router.sheet = .pairing } else if router.sheet == .pairing { router.sheet = nil }
@@ -78,6 +81,8 @@ struct ContentView: View {
                 case .pairing: PairingSheet().interactiveDismissDisabled()
                 case .keyboard: KeyboardSheet()
                 case .more: MoreSheet()
+                case .speaker: SpeakerSheet()
+                case .about: AboutView()
                 }
             }
             .presentationDetents(detents(which))
@@ -94,6 +99,7 @@ struct ContentView: View {
         switch s {
         case .pairing: return [.height(340)]
         case .keyboard: return [.height(300)]
+        case .speaker: return [.height(360)]
         case .inputs, .more: return [.medium, .large]
         default: return [.large]
         }
@@ -114,7 +120,7 @@ struct ScreenHeader: View {
                         .font(.system(size: 11, weight: .black))
                         .tracking(2.6)
                         .foregroundStyle(Theme.crimson)
-                    Button { router.sheet = .devices } label: {
+                    Button { router.tab = 3 } label: {
                         HStack(spacing: 8) {
                             Circle().fill(statusColor).frame(width: 9, height: 9)
                             Text(tv.displayName)
@@ -243,7 +249,7 @@ struct ConnectionBanner: View {
         case .pairing: return ("Retry", tv.reconnect)
         case .disconnected, .idle: return ("Connect", tv.reconnect)
         case .none: return ("Search", tv.reconnect)
-        case .choose: return ("Choose", { router.sheet = .devices })
+        case .choose: return ("Choose", { router.tab = 3 })
         case .connecting, .searching, .waking: return ("Stop", tv.disconnectNow)
         case .connected: return nil
         }
@@ -263,13 +269,10 @@ struct SplashView: View {
                 .scaleEffect(glow ? 1.1 : 0.7)
                 .opacity(glow ? 1 : 0)
             VStack(spacing: 18) {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(Theme.crimsonGradient)
-                    .frame(width: 84, height: 84)
-                    .overlay(Image(systemName: "av.remote.fill").font(.system(size: 38)).foregroundStyle(.white))
-                    .shadow(color: Theme.crimson.opacity(0.5), radius: 24, y: 10)
-                    .scaleEffect(reveal ? 1 : 0.6)
+                CrimsonMark(size: 108)
+                    .scaleEffect(reveal ? 1 : 0.7)
                     .opacity(reveal ? 1 : 0)
+                    .rotation3DEffect(.degrees(reveal ? 0 : 25), axis: (x: 1, y: 0, z: 0))
                 Text("CRIMSON")
                     .font(.system(size: 34, weight: .black))
                     .tracking(reveal ? 10 : 2)

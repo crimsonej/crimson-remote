@@ -109,6 +109,9 @@ final class TVController: ObservableObject {
     @Published var connectedIP: String?
     @Published var canSetVolume = true
     @Published var chooseTV = false
+    /// What the connected TV supports; the remote adapts to it.
+    @Published var features: Set<Feature> = []
+    var driverAsLG: LGDriver? { driver as? LGDriver }
 
     private var client: MQTTClient?
     /// The non-Hisense TV being controlled (Roku, Samsung, LG), if any.
@@ -132,6 +135,15 @@ final class TVController: ObservableObject {
     init() {
         if let d = defaults.data(forKey: "tvs"), let list = try? JSONDecoder().decode([SavedTV].self, from: d) { saved = list }
         currentID = defaults.string(forKey: "current")
+        // Keep trying quietly while a TV is off or out of reach, so it connects as soon as it's back.
+        Task { [weak self] in
+            while true {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self else { return }
+                if [.offline, .none].contains(self.status), !self.userDisconnected,
+                   UIApplication.shared.applicationState == .active { self.connect() }
+            }
+        }
     }
 
     // MARK: - Saved TVs
@@ -227,6 +239,7 @@ final class TVController: ObservableObject {
     func disconnect() { closeConnection() }
 
     private func closeConnection() {
+        features = []
         client?.close()
         client = nil
         driver?.close()
@@ -351,6 +364,7 @@ final class TVController: ObservableObject {
         driver = d
         guard await d.connect() else { driver = nil; return false }
         connectedIP = host
+        features = tv.brand.features.union(d.extraFeatures)
         if status != .pairing { status = .connected }
         canSetVolume = d.canSetVolume
         return true
@@ -383,6 +397,7 @@ final class TVController: ObservableObject {
             driver = nil
             canSetVolume = true
             connectedIP = host
+            features = TVBrand.hisense.features
             c.subscribe("/remoteapp/mobile/#")
             status = .connected
             refresh()

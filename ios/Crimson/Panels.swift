@@ -8,6 +8,11 @@ struct RemoteScreen: View {
     @AppStorage("padMode") private var touchpad = false
     @State private var playing = true
 
+    /// The connected TV's features, or its brand's while it reconnects.
+    private func has(_ f: Feature) -> Bool {
+        tv.features.isEmpty ? (tv.current?.brand.features ?? TVBrand.hisense.features).contains(f) : tv.features.contains(f)
+    }
+
     var body: some View {
         ZStack {
             AppBackground()
@@ -29,12 +34,16 @@ struct RemoteScreen: View {
                                 Spacer()
                                 DPad()
                                 Spacer()
-                                Rocker(label: "CH", up: "KEY_CHANNELUP", down: "KEY_CHANNELDOWN")
+                                if has(.channels) {
+                                    Rocker(label: "CH", up: "KEY_CHANNELUP", down: "KEY_CHANNELDOWN")
+                                } else {
+                                    Color.clear.frame(width: 56, height: 172)
+                                }
                             }
                             .transition(.opacity.combined(with: .scale(scale: 0.96)))
                         }
                         navRow
-                        mediaRow
+                        if has(.media) { mediaRow }
                     }
                     .padding(.vertical, 22)
                     .padding(.horizontal, 16)
@@ -42,6 +51,12 @@ struct RemoteScreen: View {
                     .opacity(tv.status == .connected ? 1 : 0.5)
                     .allowsHitTesting(tv.status == .connected || tv.current?.canWake == true)
                     .animation(.spring(response: 0.35, dampingFraction: 0.85), value: touchpad)
+
+                    if has(.audioOnly) || has(.speakerVolume) || has(.tvSettings) {
+                        TVFeaturesCard(audioOnly: has(.audioOnly), speaker: has(.speakerVolume), settings: has(.tvSettings))
+                            .opacity(tv.status == .connected ? 1 : 0.5)
+                            .allowsHitTesting(tv.status == .connected)
+                    }
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 8)
@@ -63,11 +78,18 @@ struct RemoteScreen: View {
             .buttonStyle(PressStyle())
             .accessibilityLabel("Power")
             Spacer()
-            round("rectangle.on.rectangle", "Input") { Haptics.tap(); router.sheet = .inputs }
-            Spacer()
+            if has(.inputList) {
+                round("rectangle.on.rectangle", "Input") { Haptics.tap(); router.sheet = .inputs }
+                Spacer()
+            } else if has(.sourceKey) {
+                round("rectangle.on.rectangle", "Source") { tv.key("KEY_SOURCE") }
+                Spacer()
+            }
             round("speaker.slash.fill", "Mute") { tv.key("KEY_MUTE") }
-            Spacer()
-            round("keyboard", "Keyboard") { Haptics.tap(); router.sheet = .keyboard }
+            if has(.keyboard) {
+                Spacer()
+                round("keyboard", "Keyboard") { Haptics.tap(); router.sheet = .keyboard }
+            }
         }
     }
 
@@ -267,6 +289,7 @@ struct TouchpadSurface: View {
             .contentShape(Rectangle())
             .gesture(drag)
 
+            if tv.current?.brand == .hisense {
             Button {
                 tv.key("KEY_LEFTMOUSEKEYS")
                 withAnimation(Theme.spring) { pointer.toggle() }
@@ -280,6 +303,7 @@ struct TouchpadSurface: View {
             }
             .padding(10)
             .accessibilityLabel("Pointer mode")
+            }
         }
     }
 
@@ -381,10 +405,15 @@ struct MoreSheet: View {
     private let colors: [(Color, String, String)] = [(Theme.red, "KEY_RED", "Red"), (Theme.green, "KEY_GREEN", "Green"),
                                                       (Color(hex: 0xEAB308), "KEY_YELLOW", "Yellow"), (Color(hex: 0x3B82F6), "KEY_BLUE", "Blue")]
 
+    private func has(_ f: Feature) -> Bool {
+        tv.features.isEmpty ? (tv.current?.brand.features ?? []).contains(f) : tv.features.contains(f)
+    }
+
     var body: some View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 16) {
                 Text("More buttons").font(.system(size: 20, weight: .heavy)).foregroundStyle(Theme.text)
+                if has(.numbers) {
                 VStack(spacing: 10) {
                     ForEach(0..<rows.count, id: \.self) { r in
                         HStack(spacing: 10) {
@@ -401,6 +430,8 @@ struct MoreSheet: View {
                         }
                     }
                 }
+                }
+                if has(.colorKeys) {
                 HStack(spacing: 12) {
                     ForEach(colors, id: \.1) { c in
                         Button { tv.key(c.1) } label: {
@@ -409,6 +440,7 @@ struct MoreSheet: View {
                         .buttonStyle(PressStyle())
                         .accessibilityLabel(c.2)
                     }
+                }
                 }
                 Button { tv.key("KEY_EXIT") } label: {
                     Label("Exit", systemImage: "xmark.circle")
@@ -620,5 +652,84 @@ struct AppTile: View {
         .onAppear {
             withAnimation(.spring(response: 0.4, dampingFraction: 0.8).delay(Double(index) * 0.03)) { shown = true }
         }
+    }
+}
+
+
+// MARK: - TV features
+
+/// Extra things this TV can do, shown only when it supports them.
+struct TVFeaturesCard: View {
+    @EnvironmentObject var tv: TVController
+    @EnvironmentObject var router: SheetRouter
+    let audioOnly: Bool
+    let speaker: Bool
+    let settings: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("TV FEATURES").sectionLabel()
+            HStack(spacing: 10) {
+                if audioOnly { tile("tv.slash", "Audio only", "Picture off") { tv.audioOnly() } }
+                if speaker { tile("hifispeaker.2.fill", "Speakers", "External volume") { Haptics.tap(); router.sheet = .speaker } }
+                if settings { tile("slider.horizontal.3", "TV settings", "Sound, picture") { Haptics.tap(); tv.openTVSettings() } }
+            }
+        }
+        .padding(16)
+        .card(radius: 24)
+    }
+
+    private func tile(_ icon: String, _ title: String, _ sub: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Theme.crimson)
+                    .frame(width: 36, height: 36)
+                    .background(Circle().fill(Theme.crimson.opacity(0.14)))
+                Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
+                Text(sub).font(.system(size: 11)).foregroundStyle(Theme.sub).lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Theme.surface2.opacity(0.7)))
+        }
+        .buttonStyle(PressStyle(scale: 0.96))
+    }
+}
+
+/// Opens the TV's external-speaker (headphone) volume and steps it up or down.
+struct SpeakerSheet: View {
+    @EnvironmentObject var tv: TVController
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 18) {
+            VStack(spacing: 6) {
+                Text("Speaker volume").font(.system(size: 20, weight: .heavy)).foregroundStyle(Theme.text)
+                Text("Adjusts the external speakers or headphones. Watch the slider on the TV.")
+                    .font(.system(size: 13)).foregroundStyle(Theme.sub).multilineTextAlignment(.center)
+            }
+            HStack(spacing: 28) {
+                RepeatButton(action: { tv.speakerStep(up: false) }) {
+                    Image(systemName: "minus").font(.system(size: 26, weight: .semibold)).foregroundStyle(Theme.text).key(76)
+                }
+                .accessibilityLabel("Speaker volume down")
+                Image(systemName: "hifispeaker.2.fill").font(.system(size: 30)).foregroundStyle(Theme.crimson)
+                RepeatButton(action: { tv.speakerStep(up: true) }) {
+                    Image(systemName: "plus").font(.system(size: 26, weight: .semibold)).foregroundStyle(Theme.text).key(76)
+                }
+                .accessibilityLabel("Speaker volume up")
+            }
+            Button { tv.closeTVPanel(); dismiss() } label: {
+                Text("Done").font(.system(size: 16, weight: .bold)).foregroundStyle(.white)
+                    .frame(maxWidth: .infinity).frame(height: 50)
+                    .background(Capsule().fill(Theme.crimsonGradient))
+            }
+            .buttonStyle(PressStyle(scale: 0.97))
+        }
+        .padding(22)
+        .onAppear { tv.openSpeakerVolume() }
+        .onDisappear { tv.closeTVPanel() }
     }
 }

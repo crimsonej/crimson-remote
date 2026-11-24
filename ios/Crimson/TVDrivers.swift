@@ -37,6 +37,8 @@ class TVDriver {
     var events: DriverEvents
     var isConnected: Bool { false }
     var canSetVolume: Bool { false }
+    /// Features this particular TV adds to its brand's set (learned while connecting).
+    var extraFeatures: Set<Feature> = []
     let defaults = UserDefaults.standard
 
     init(ip: String, id: String, events: DriverEvents) {
@@ -265,6 +267,7 @@ final class RokuDriver: TVDriver {
         let model = TVDriver.tag(info, "model-name") ?? ""
         let name = TVDriver.tag(info, "user-device-name")
         let mac = TVDriver.tag(info, "network-type") == "ethernet" ? TVDriver.tag(info, "ethernet-mac") : TVDriver.tag(info, "wifi-mac")
+        if TVDriver.tag(info, "is-tv") == "true" { extraFeatures = [.channels, .inputList] }
         main {
             self.events.model("Roku \(model)")
             if let mac { self.events.mac(mac) }
@@ -582,6 +585,8 @@ final class LGDriver: TVDriver {
     }
 
     override func setVolume(_ v: Int) { request("ssap://audio/setVolume", ["volume": v]) }
+    /// Picture off, sound on.
+    func screenOff() { request("ssap://com.webos.service.tvpower/power/turnOffScreen", ["standbyMode": "active"]) }
     override func launch(_ app: TVApp) { request("ssap://system.launcher/launch", ["id": app.appId]) }
     override func source(_ s: TVSource) { request("ssap://tv/switchInput", ["inputId": s.sourceId]) }
 }

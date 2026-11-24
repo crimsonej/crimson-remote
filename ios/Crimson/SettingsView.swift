@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var tv: TVController
+    @EnvironmentObject var router: SheetRouter
     @Environment(\.dismiss) private var dismiss
     var openDevices: () -> Void
     @AppStorage("appearance") private var appearance = Appearance.system.rawValue
@@ -150,17 +151,21 @@ struct SettingsView: View {
                 }
 
                 section("About") {
-                    HStack(spacing: 12) {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.crimsonGradient)
-                            .frame(width: 34, height: 34)
-                            .overlay(Image(systemName: "av.remote.fill").foregroundStyle(.white).font(.system(size: 15)))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Crimson Remote").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
-                            Text("Version \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0") · by crimson")
-                                .font(.system(size: 12)).foregroundStyle(Theme.sub)
+                    Button { Haptics.tap(); router.sheet = .about } label: {
+                        HStack(spacing: 12) {
+                            CrimsonMark(size: 40, animate: false)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Crimson Remote").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
+                                Text("Version \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?") \u{00B7} by crimson")
+                                    .font(.system(size: 12)).foregroundStyle(Theme.sub)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.faint)
                         }
+                        .padding(14)
+                        .contentShape(Rectangle())
                     }
-                    .padding(14)
+                    .buttonStyle(PressStyle(scale: 0.98))
                 }
             }
             .padding(22)
