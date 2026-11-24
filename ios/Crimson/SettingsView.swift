@@ -6,6 +6,7 @@ struct SettingsView: View {
     var openDevices: () -> Void
     @AppStorage("appearance") private var appearance = Appearance.system.rawValue
     @AppStorage("accent") private var accent = Accent.crimson.rawValue
+    @AppStorage("style") private var style = ThemeStyle.glow.rawValue
     @AppStorage("haptics") private var haptics = true
     @State private var address = ""
 
@@ -90,6 +91,31 @@ struct SettingsView: View {
                     .padding(12)
                     divider
                     VStack(alignment: .leading, spacing: 10) {
+                        Text("Style").font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.sub)
+                        ForEach(ThemeStyle.allCases) { st in
+                            Button {
+                                Haptics.tick()
+                                style = st.rawValue
+                            } label: {
+                                HStack(spacing: 12) {
+                                    stylePreview(st)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(st.label).font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
+                                        Text(st.blurb).font(.system(size: 12)).foregroundStyle(Theme.sub)
+                                    }
+                                    Spacer()
+                                    Image(systemName: style == st.rawValue ? "checkmark.circle.fill" : "circle")
+                                        .font(.system(size: 20))
+                                        .foregroundStyle(style == st.rawValue ? Theme.crimson : Theme.faint)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(PressStyle(scale: 0.98))
+                        }
+                    }
+                    .padding(14)
+                    divider
+                    VStack(alignment: .leading, spacing: 10) {
                         Text("Accent colour").font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.sub)
                         HStack(spacing: 12) {
                             ForEach(Accent.allCases) { a in
@@ -140,6 +166,21 @@ struct SettingsView: View {
             .padding(22)
         }
 
+    }
+
+    /// A tiny swatch that shows what each style looks like.
+    private func stylePreview(_ st: ThemeStyle) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(st == .oled ? Color.black : st == .solid ? Color(hex: 0x17171E) : Color(hex: 0x1A0B11))
+            if st == .glow {
+                Circle().fill(Theme.crimson.opacity(0.7)).frame(width: 26).blur(radius: 8).offset(x: -8, y: -6)
+                Circle().fill(Theme.partner.opacity(0.6)).frame(width: 22).blur(radius: 8).offset(x: 10, y: 8)
+            }
+            RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(st == .glow ? 0.18 : 0.10)).frame(width: 26, height: 14)
+        }
+        .frame(width: 44, height: 44)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private var divider: some View { Rectangle().fill(Theme.stroke).frame(height: 1).padding(.leading, 14) }

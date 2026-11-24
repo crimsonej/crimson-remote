@@ -6,7 +6,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.4.3"
+    MARKETING_VERSION: "1.5"
     CURRENT_PROJECT_VERSION: "1"
 targets:
   Crimson:
@@ -32,7 +32,6 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Crimson Remote
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
-        INFOPLIST_KEY_UIUserInterfaceStyle: Dark
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Crimson finds and controls your TV on this Wi-Fi."
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
         CODE_SIGNING_ALLOWED: NO

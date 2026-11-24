@@ -3,75 +3,205 @@ import Network
 import SwiftUI
 import PhotosUI
 import AVKit
+import AVFoundation
 import UniformTypeIdentifiers
 
 /// Casts photos and videos to the TV with DLNA: the iPhone serves the file on a
-/// small web server and tells the TV's media renderer to play that address.
+/// small web server and tells the TV's media renderer to play it. One shared
+/// instance, so casting keeps going when you switch screens.
 @MainActor
 final class Caster: ObservableObject {
-    @Published var status = "Nothing casting"
-    @Published var busy = false
+    static let shared = Caster()
+
+    enum Phase: Equatable { case idle, preparing, sending, playing, paused, stopped, failed }
+
+    @Published var phase: Phase = .idle
+    @Published var message = ""
+    @Published var title = ""
+    @Published var isPhoto = false
+    @Published var position: Double = 0
+    @Published var duration: Double = 0
+    @Published var thumbnail: UIImage?
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "crimson.cast")
     private var fileURL: URL?
     private var mime = "application/octet-stream"
     private var controlURL: URL?
+    private var tvIP = ""
+    private var poller: Task<Void, Never>?
     private let port: UInt16 = 8790
 
-    func cast(_ file: URL, mime: String, tvIP: String) async {
-        busy = true
-        defer { busy = false }
-        status = "Sending to the TV…"
+    var active: Bool { [.sending, .playing, .paused].contains(phase) }
+
+    /// Picks up a Photos item, converts it if needed, and casts it.
+    func cast(_ item: PhotosPickerItem, tvIP: String) async {
+        phase = .preparing
+        message = "Getting it ready…"
+        let isVideo = item.supportedContentTypes.contains { $0.conforms(to: .movie) }
+        if isVideo, let movie = try? await item.loadTransferable(type: PickedMovie.self) {
+            thumbnail = await Self.thumbnail(of: movie.url)
+            message = "Converting the video for the TV…"
+            guard let mp4 = await Self.toMP4(movie.url) else { fail("Couldn't convert this video"); return }
+            await cast(mp4, mime: "video/mp4", title: "Video", photo: false, tvIP: tvIP)
+        } else if let data = try? await item.loadTransferable(type: Data.self),
+                  let image = UIImage(data: data), let jpeg = Self.fit(image).jpegData(compressionQuality: 0.88) {
+            thumbnail = image
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("crimson-photo-\(Int(Date().timeIntervalSince1970)).jpg")
+            try? jpeg.write(to: url)
+            await cast(url, mime: "image/jpeg", title: "Photo", photo: true, tvIP: tvIP)
+        } else {
+            fail("Couldn't read that item")
+        }
+    }
+
+    private func cast(_ file: URL, mime: String, title: String, photo: Bool, tvIP: String) async {
+        phase = .sending
+        message = "Sending to the TV…"
+        self.title = title
+        isPhoto = photo
+        position = 0
+        duration = 0
         do {
             guard let phone = TVController.wifiAddress() else { throw CastError("Connect the iPhone to Wi-Fi first") }
             try await prepare(tvIP)
             try startServer()
             fileURL = file
             self.mime = mime
-            let ext = file.pathExtension.isEmpty ? "bin" : file.pathExtension
-            let url = "http://\(phone):\(port)/media/\(Int(Date().timeIntervalSince1970)).\(ext)"
+            let url = "http://\(phone):\(port)/media/\(Int(Date().timeIntervalSince1970)).\(file.pathExtension)"
             _ = try? await soap("Stop", "<InstanceID>0</InstanceID>")
             _ = try await soap("SetAVTransportURI",
-                               "<InstanceID>0</InstanceID><CurrentURI>\(esc(url))</CurrentURI><CurrentURIMetaData>\(esc(didl(url, file.lastPathComponent)))</CurrentURIMetaData>")
+                               "<InstanceID>0</InstanceID><CurrentURI>\(esc(url))</CurrentURI><CurrentURIMetaData>\(esc(didl(url, title)))</CurrentURIMetaData>")
             _ = try await soap("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
-            status = "Casting \(mime.hasPrefix("image") ? "photo" : mime.hasPrefix("audio") ? "music" : "video")"
+            phase = .playing
+            message = photo ? "Showing on the TV" : "Playing on the TV"
+            startPolling()
         } catch {
-            status = (error as? CastError)?.message ?? "Couldn't cast: \(error.localizedDescription)"
+            fail((error as? CastError)?.message ?? "Couldn't cast: \(error.localizedDescription)")
         }
     }
 
-    func control(_ action: String) async {
-        do {
-            switch action {
-            case "play": _ = try await soap("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
-            case "pause": _ = try await soap("Pause", "<InstanceID>0</InstanceID>")
-            default:
-                _ = try await soap("Stop", "<InstanceID>0</InstanceID>")
-                status = "Nothing casting"
-            }
-        } catch {
-            status = "Choose something to cast first"
+    func playPause() {
+        Task {
+            do {
+                if phase == .playing { _ = try await soap("Pause", "<InstanceID>0</InstanceID>"); phase = .paused }
+                else { _ = try await soap("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>"); phase = .playing }
+            } catch { fail("The TV stopped responding") }
         }
+    }
+
+    func stop() {
+        Task {
+            _ = try? await soap("Stop", "<InstanceID>0</InstanceID>")
+            poller?.cancel()
+            phase = .stopped
+            message = "Stopped"
+        }
+    }
+
+    func seek(to seconds: Double) {
+        let t = Int(seconds)
+        let target = String(format: "%02d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60)
+        Task { _ = try? await soap("Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>\(target)</Target>") }
+    }
+
+    private func fail(_ m: String) {
+        poller?.cancel()
+        phase = .failed
+        message = m
+    }
+
+    /// Follows what the TV is doing: playing, paused, stopped, and how far along.
+    private func startPolling() {
+        poller?.cancel()
+        poller = Task { [weak self] in
+            var misses = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                guard let info = try? await self.soap("GetTransportInfo", "<InstanceID>0</InstanceID>") else {
+                    misses += 1
+                    if misses > 5 { self.fail("Lost contact with the TV"); return }
+                    continue
+                }
+                misses = 0
+                let state = Self.tag(info, "CurrentTransportState") ?? ""
+                switch state {
+                case "PLAYING": self.phase = .playing
+                case "PAUSED_PLAYBACK": self.phase = .paused
+                case "STOPPED", "NO_MEDIA_PRESENT":
+                    if self.phase == .playing && !self.isPhoto && self.duration > 0 && self.position >= self.duration - 2 {
+                        self.phase = .stopped; self.message = "Finished"; return
+                    }
+                default: break
+                }
+                if !self.isPhoto, let pos = try? await self.soap("GetPositionInfo", "<InstanceID>0</InstanceID>") {
+                    self.position = Self.seconds(Self.tag(pos, "RelTime"))
+                    let d = Self.seconds(Self.tag(pos, "TrackDuration"))
+                    if d > 0 { self.duration = d }
+                }
+            }
+        }
+    }
+
+    // MARK: - Media preparation
+
+    /// Converts any video to H.264 MP4 at up to 1080p, which nearly every TV can play.
+    nonisolated static func toMP4(_ url: URL) async -> URL? {
+        let asset = AVURLAsset(url: url)
+        guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPreset1920x1080) else { return nil }
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("crimson-video-\(Int(Date().timeIntervalSince1970)).mp4")
+        try? FileManager.default.removeItem(at: out)
+        export.outputURL = out
+        export.outputFileType = .mp4
+        export.shouldOptimizeForNetworkUse = true
+        await export.export()
+        return export.status == .completed ? out : nil
+    }
+
+    nonisolated static func thumbnail(of url: URL) async -> UIImage? {
+        let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: 400, height: 400)
+        guard let cg = try? gen.copyCGImage(at: CMTime(seconds: 1, preferredTimescale: 600), actualTime: nil) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+
+    /// Scales very large photos down to 4K so the TV opens them quickly.
+    static func fit(_ image: UIImage) -> UIImage {
+        let maxSide: CGFloat = 3840
+        let s = max(image.size.width, image.size.height)
+        guard s > maxSide else { return image }
+        let k = maxSide / s
+        let size = CGSize(width: image.size.width * k, height: image.size.height * k)
+        return UIGraphicsImageRenderer(size: size).image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
     }
 
     // MARK: - UPnP
 
-    private func prepare(_ tvIP: String) async throws {
-        if let c = controlURL, c.host == tvIP { return }
-        let base = "http://\(tvIP):38400"
-        guard let descURL = URL(string: base + "/MediaServer/rendererdevicedesc.xml") else { throw CastError("Bad TV address") }
-        var req = URLRequest(url: descURL)
+    private func prepare(_ ip: String) async throws {
+        if let c = controlURL, c.host == ip { return }
+        tvIP = ip
+        // Hisense, then Samsung's description; other TVs are found through the TV's own list.
+        for desc in ["http://\(ip):38400/MediaServer/rendererdevicedesc.xml", "http://\(ip):9197/dmr"] {
+            if let control = await Self.controlURL(from: desc) { controlURL = control; return }
+        }
+        throw CastError("This TV doesn't accept casting right now")
+    }
+
+    nonisolated private static func controlURL(from desc: String) async -> URL? {
+        guard let u = URL(string: desc) else { return nil }
+        var req = URLRequest(url: u)
         req.timeoutInterval = 4
-        guard let (data, _) = try? await URLSession.shared.data(for: req) else { throw CastError("This TV doesn't accept casting right now") }
+        guard let (data, _) = try? await URLSession.shared.data(for: req) else { return nil }
         let xml = String(decoding: data, as: UTF8.self)
         guard let svc = xml.range(of: ":service:AVTransport:"),
               let a = xml.range(of: "<controlURL>", range: svc.upperBound..<xml.endIndex),
-              let b = xml.range(of: "</controlURL>", range: a.upperBound..<xml.endIndex) else {
-            throw CastError("This TV doesn't accept casting")
-        }
+              let b = xml.range(of: "</controlURL>", range: a.upperBound..<xml.endIndex) else { return nil }
         let path = xml[a.upperBound..<b.lowerBound].trimmingCharacters(in: .whitespaces)
-        controlURL = URL(string: path.hasPrefix("http") ? path : base + (path.hasPrefix("/") ? "" : "/") + path)
+        if path.hasPrefix("http") { return URL(string: path) }
+        let base = "\(u.scheme ?? "http")://\(u.host ?? ""):\(u.port ?? 80)"
+        return URL(string: base + (path.hasPrefix("/") ? "" : "/") + path)
     }
 
     private func soap(_ action: String, _ args: String) async throws -> String {
@@ -94,12 +224,26 @@ final class Caster: ObservableObject {
 
     private func didl(_ url: String, _ title: String) -> String {
         let cls = mime.hasPrefix("image") ? "object.item.imageItem.photo" : mime.hasPrefix("audio") ? "object.item.audioItem.musicTrack" : "object.item.videoItem"
-        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"><item id=\"1\" parentID=\"0\" restricted=\"1\"><dc:title>\(esc(title))</dc:title><upnp:class>\(cls)</upnp:class><res protocolInfo=\"http-get:*:\(mime):*\">\(esc(url))</res></item></DIDL-Lite>"
+        let flags = mime.hasPrefix("image") ? "DLNA.ORG_OP=00;DLNA.ORG_FLAGS=00900000000000000000000000000000"
+            : "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"><item id=\"1\" parentID=\"0\" restricted=\"1\"><dc:title>\(esc(title))</dc:title><upnp:class>\(cls)</upnp:class><res protocolInfo=\"http-get:*:\(mime):\(flags)\">\(esc(url))</res></item></DIDL-Lite>"
     }
 
     private func esc(_ s: String) -> String {
         s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;").replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    nonisolated static func tag(_ xml: String, _ t: String) -> String? {
+        guard let a = xml.range(of: "<\(t)>"), let b = xml.range(of: "</\(t)>", range: a.upperBound..<xml.endIndex) else { return nil }
+        return String(xml[a.upperBound..<b.lowerBound])
+    }
+
+    nonisolated static func seconds(_ hms: String?) -> Double {
+        guard let hms else { return 0 }
+        let p = hms.split(separator: ":").compactMap { Double($0) }
+        guard p.count == 3 else { return 0 }
+        return p[0] * 3600 + p[1] * 60 + p[2]
     }
 
     // MARK: - File server
@@ -111,6 +255,9 @@ final class Caster: ObservableObject {
         let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         l.newConnectionHandler = { [weak self] conn in
             Task { @MainActor in self?.serve(conn) }
+        }
+        l.stateUpdateHandler = { [weak self] state in
+            if case .failed = state { Task { @MainActor in self?.listener = nil } }
         }
         l.start(queue: queue)
         listener = l
@@ -145,7 +292,7 @@ final class Caster: ObservableObject {
             conn.send(content: Data(head.utf8), completion: .contentProcessed { _ in
                 if isHead { conn.cancel(); return }
                 try? handle.seek(toOffset: UInt64(from))
-                Self.pump(conn, handle, remaining: length)
+                Caster.pump(conn, handle, remaining: length)
             })
         }
     }
@@ -193,111 +340,168 @@ struct AirPlayButton: UIViewRepresentable {
     func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
 }
 
-struct CastPanel: View {
+// MARK: - Cast screen
+
+struct CastScreen: View {
     @EnvironmentObject var tv: TVController
-    @StateObject private var caster = Caster()
+    @ObservedObject private var caster = Caster.shared
     @ObservedObject private var desktop = DesktopModel.shared
     @State private var item: PhotosPickerItem?
     @State private var showDesktop = false
+    @State private var scrubbing = false
+    @State private var scrub: Double = 0
 
     var body: some View {
-        VStack(spacing: 14) {
-            card(icon: "play.rectangle.fill", title: "Photos & videos",
-                 text: "Send a photo or video from this iPhone to the TV over Wi-Fi.") {
-                PhotosPicker(selection: $item, matching: .any(of: [.images, .videos])) {
-                    actionLabel(caster.busy ? "Sending…" : "Choose from Photos")
+        ZStack {
+            AppBackground()
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 22) {
+                    ScreenHeader(title: "Cast")
+
+                    if caster.phase != .idle { nowCasting }
+
+                    PhotosPicker(selection: $item, matching: .any(of: [.images, .videos])) {
+                        HStack(spacing: 16) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.system(size: 24, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(width: 58, height: 58)
+                                .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Theme.crimsonGradient))
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Photos & videos").font(.system(size: 17, weight: .bold)).foregroundStyle(Theme.text)
+                                Text("Pick something to show on the TV").font(.system(size: 13)).foregroundStyle(Theme.sub)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.system(size: 14, weight: .bold)).foregroundStyle(Theme.faint)
+                        }
+                        .padding(16)
+                        .card(radius: 24)
+                    }
+                    .buttonStyle(PressStyle(scale: 0.98))
+                    .disabled(caster.phase == .preparing || caster.phase == .sending || tv.status != .connected)
+                    .opacity(tv.status == .connected ? 1 : 0.5)
+
+                    Text("MORE WAYS").sectionLabel().padding(.top, 4)
+                    VStack(spacing: 0) {
+                        HStack(spacing: 14) {
+                            rowIcon("airplayvideo")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Mirror with AirPlay").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
+                                Text("Only for TVs that support AirPlay").font(.system(size: 12)).foregroundStyle(Theme.sub)
+                            }
+                            Spacer()
+                            AirPlayButton().frame(width: 40, height: 40)
+                        }
+                        .padding(14)
+                        Divider().padding(.leading, 66)
+                        Button { Haptics.tap(); showDesktop = true } label: {
+                            HStack(spacing: 14) {
+                                rowIcon("desktopcomputer")
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Crimson Desktop").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
+                                    Text(desktop.connected ? "On the TV now \u{00B7} open the controls" : "Over AirPlay or an HDMI adapter")
+                                        .font(.system(size: 12)).foregroundStyle(Theme.sub)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.system(size: 13, weight: .bold)).foregroundStyle(Theme.faint)
+                            }
+                            .padding(14)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(PressStyle(scale: 0.98))
+                    }
+                    .card(radius: 22)
                 }
-                .buttonStyle(PressStyle(scale: 0.97))
-                .disabled(caster.busy)
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 30)
             }
-            HStack(spacing: 8) {
-                control("Play", "play")
-                control("Pause", "pause")
-                control("Stop", "stop")
-            }
-            Text(caster.status)
-                .font(.system(size: 12)).foregroundStyle(Theme.faint)
-                .frame(maxWidth: .infinity)
-            card(icon: "airplayvideo", title: "Mirror this iPhone",
-                 text: "Mirroring uses AirPlay. It works only if your TV lists AirPlay; this Hisense uses Screen Share (Miracast), which iPhones can't send to.") {
-                HStack {
-                    Text("AirPlay receivers").font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.text)
-                    Spacer()
-                    AirPlayButton().frame(width: 44, height: 44)
-                }
-                .padding(.horizontal, 14)
-                .frame(height: 44)
-                .card(radius: 22, fill: Theme.surface2)
-            }
-            card(icon: "desktopcomputer", title: "Crimson Desktop",
-                 text: desktop.connected ? "The TV is showing the Crimson desktop. Open the controls to use your iPhone as its trackpad and keyboard."
-                     : "Connect the iPhone to the TV with AirPlay or an HDMI adapter cable, and the TV shows a desktop with a web browser.") {
-                Button { Haptics.tap(); showDesktop = true } label: {
-                    actionLabel(desktop.connected ? "Open desktop controls" : "Open controls")
-                }
-                .buttonStyle(PressStyle(scale: 0.97))
-            }
+        }
+        .onChange(of: item) { newItem in
+            guard let newItem else { return }
+            guard let ip = tv.connectedIP ?? tv.current?.ip else { tv.show("Connect to a TV first"); return }
+            Task { await caster.cast(newItem, tvIP: ip); item = nil }
         }
         .fullScreenCover(isPresented: $showDesktop) {
             DesktopControls()
                 .environmentObject(DesktopModel.shared)
                 .background(Theme.bg.ignoresSafeArea())
         }
-        .onChange(of: item) { newItem in
-            guard let newItem else { return }
-            Task { await send(newItem) }
-        }
     }
 
-    private func send(_ item: PhotosPickerItem) async {
-        guard let ip = tv.connectedIP ?? tv.current?.ip else {
-            caster.status = "Connect to a TV first"
-            return
-        }
-        let isVideo = item.supportedContentTypes.contains { $0.conforms(to: .movie) }
-        if isVideo, let movie = try? await item.loadTransferable(type: PickedMovie.self) {
-            let type = UTType(filenameExtension: movie.url.pathExtension)?.preferredMIMEType ?? "video/mp4"
-            await caster.cast(movie.url, mime: type, tvIP: ip)
-        } else if let data = try? await item.loadTransferable(type: Data.self),
-                  let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: 0.9) {
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent("cast-\(Int(Date().timeIntervalSince1970)).jpg")
-            try? jpeg.write(to: url)
-            await caster.cast(url, mime: "image/jpeg", tvIP: ip)
-        } else {
-            caster.status = "Couldn't read that item"
-        }
-        self.item = nil
-    }
-
-    private func control(_ title: String, _ action: String) -> some View {
-        Button { Haptics.tap(); Task { await caster.control(action) } } label: {
-            Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
-                .frame(maxWidth: .infinity).frame(height: 46)
-                .card(radius: 23, fill: Theme.surface2)
-        }
-        .buttonStyle(PressStyle())
-    }
-
-    private func actionLabel(_ t: String) -> some View {
-        Text(t).font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
-            .frame(maxWidth: .infinity).frame(height: 44)
-            .background(Capsule().fill(Theme.crimsonGradient))
-    }
-
-    private func card<Content: View>(icon: String, title: String, text: String, @ViewBuilder _ content: () -> Content) -> some View {
+    private var nowCasting: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 14) {
-                RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Theme.crimson.opacity(0.15))
-                    .frame(width: 44, height: 44)
-                    .overlay(Image(systemName: icon).font(.system(size: 18, weight: .semibold)).foregroundStyle(Theme.crimson))
+            HStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Theme.surface2)
+                    if let t = caster.thumbnail {
+                        Image(uiImage: t).resizable().scaledToFill()
+                    } else {
+                        Image(systemName: caster.isPhoto ? "photo" : "film").foregroundStyle(Theme.faint)
+                    }
+                }
+                .frame(width: 64, height: 64)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(title).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
-                    Text(text).font(.system(size: 12)).foregroundStyle(Theme.sub).fixedSize(horizontal: false, vertical: true)
+                    Text("NOW CASTING").sectionLabel()
+                    Text(caster.message).font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(caster.phase == .failed ? Theme.red : Theme.text)
+                        .lineLimit(2)
+                }
+                Spacer()
+                if caster.phase == .preparing || caster.phase == .sending { ProgressView().tint(Theme.crimson) }
+            }
+            if !caster.isPhoto && caster.duration > 0 {
+                VStack(spacing: 4) {
+                    Slider(value: Binding(get: { scrubbing ? scrub : caster.position },
+                                          set: { scrub = $0 }),
+                           in: 0...max(caster.duration, 1)) { editing in
+                        scrubbing = editing
+                        if !editing { caster.seek(to: scrub) }
+                    }
+                    .tint(Theme.crimson)
+                    HStack {
+                        Text(time(caster.position)); Spacer(); Text(time(caster.duration))
+                    }
+                    .font(.system(size: 11).monospacedDigit()).foregroundStyle(Theme.sub)
                 }
             }
-            content()
+            if caster.active {
+                HStack(spacing: 10) {
+                    if !caster.isPhoto {
+                        castButton(caster.phase == .playing ? "pause.fill" : "play.fill",
+                                   caster.phase == .playing ? "Pause" : "Play", primary: true) { caster.playPause() }
+                    }
+                    castButton("stop.fill", "Stop casting", primary: caster.isPhoto) { caster.stop() }
+                }
+            }
         }
         .padding(16)
-        .card(radius: 20)
+        .card(radius: 24)
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    private func castButton(_ icon: String, _ label: String, primary: Bool, _ action: @escaping () -> Void) -> some View {
+        Button { Haptics.tap(); action() } label: {
+            Label(label, systemImage: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(primary ? Color.white : Theme.text)
+                .frame(maxWidth: .infinity).frame(height: 46)
+                .background(Capsule().fill(primary ? AnyShapeStyle(Theme.crimsonGradient) : AnyShapeStyle(Theme.surface2)))
+        }
+        .buttonStyle(PressStyle(scale: 0.97))
+    }
+
+    private func rowIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(Theme.crimson)
+            .frame(width: 40, height: 40)
+            .background(Circle().fill(Theme.crimson.opacity(0.14)))
+    }
+
+    private func time(_ s: Double) -> String {
+        let t = Int(s)
+        return t >= 3600 ? String(format: "%d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60) : String(format: "%d:%02d", t / 60, t % 60)
     }
 }
