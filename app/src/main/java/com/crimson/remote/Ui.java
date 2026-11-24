@@ -20,11 +20,54 @@ import android.widget.TextView;
 
 /** Colours, shapes and the shared press behaviour for every control. */
 final class Ui {
-    static final int BG_TOP = 0xFF1A0B11, BG_BOTTOM = 0xFF0B0B10;
-    static final int SURFACE = 0xFF17171E, SURFACE2 = 0xFF20202A, STROKE = 0xFF2C2C38;
-    static final int TEXT = 0xFFF2F2F5, SUB = 0xFF9A9AAB, FAINT = 0xFF5E5E6E;
-    static final int CRIMSON = 0xFFE11D48, CRIMSON_DARK = 0xFF9F1239, CRIMSON_SOFT = 0x33E11D48;
+    // The live palette. applyTheme() fills these in from the saved appearance and accent.
+    static int BG_TOP = 0xFF1A0B11, BG_BOTTOM = 0xFF0B0B10;
+    static int SURFACE = 0xFF17171E, SURFACE2 = 0xFF20202A, STROKE = 0xFF2C2C38, RAISED = 0xFF22222C, TRACK = 0xFF3A3A48;
+    static int TEXT = 0xFFF2F2F5, SUB = 0xFF9A9AAB, FAINT = 0xFF5E5E6E, RIPPLE = 0x30FFFFFF, SHEET = 0xFF15151C;
+    static int CRIMSON = 0xFFE11D48, CRIMSON_DARK = 0xFF9F1239, CRIMSON_SOFT = 0x33E11D48;
     static final int GREEN = 0xFF22C55E, AMBER = 0xFFF59E0B, RED = 0xFFEF4444;
+    static boolean dark = true;
+    static boolean haptics = true;
+
+    /** Accent families: name, main, deep. Crimson is the brand default. */
+    static final String[] ACCENT_NAMES = {"Crimson", "Ocean", "Emerald", "Violet", "Amber", "Mono"};
+    static final int[] ACCENT_MAIN = {0xFFE11D48, 0xFF0EA5E9, 0xFF10B981, 0xFF8B5CF6, 0xFFF59E0B, 0xFF6B7280};
+    static final int[] ACCENT_DEEP = {0xFF9F1239, 0xFF0369A1, 0xFF047857, 0xFF5B21B6, 0xFFB45309, 0xFF374151};
+
+    /** mode: 0 = follow system, 1 = light, 2 = dark. */
+    static void applyTheme(Context c) {
+        android.content.SharedPreferences p = c.getSharedPreferences("crimson", Context.MODE_PRIVATE);
+        int mode = p.getInt("appearance", 0);
+        int accent = Math.max(0, Math.min(ACCENT_MAIN.length - 1, p.getInt("accent", 0)));
+        haptics = p.getBoolean("haptics", true);
+        boolean systemDark = (c.getResources().getConfiguration().uiMode
+                & android.content.res.Configuration.UI_MODE_NIGHT_MASK) == android.content.res.Configuration.UI_MODE_NIGHT_YES;
+        dark = mode == 2 || (mode == 0 && systemDark);
+        CRIMSON = ACCENT_MAIN[accent];
+        CRIMSON_DARK = ACCENT_DEEP[accent];
+        CRIMSON_SOFT = (CRIMSON & 0x00FFFFFF) | 0x33000000;
+        if (dark) {
+            BG_BOTTOM = 0xFF0B0B10; SURFACE = 0xFF17171E; SURFACE2 = 0xFF20202A; STROKE = 0xFF2C2C38;
+            RAISED = 0xFF22222C; TRACK = 0xFF3A3A48; TEXT = 0xFFF2F2F5; SUB = 0xFF9A9AAB; FAINT = 0xFF5E5E6E;
+            RIPPLE = 0x30FFFFFF; SHEET = 0xFF15151C;
+            BG_TOP = blend(BG_BOTTOM, CRIMSON, 0.10f);
+        } else {
+            BG_BOTTOM = 0xFFF5F5F8; SURFACE = 0xFFFFFFFF; SURFACE2 = 0xFFF0F0F5; STROKE = 0xFFE3E3EA;
+            RAISED = 0xFFFFFFFF; TRACK = 0xFFD9D9E2; TEXT = 0xFF14141A; SUB = 0xFF5C5C6C; FAINT = 0xFF9A9AAB;
+            RIPPLE = 0x22000000; SHEET = 0xFFF7F7FA;
+            BG_TOP = blend(BG_BOTTOM, CRIMSON, 0.12f);
+        }
+    }
+
+    static int blend(int a, int b, float t) {
+        return Color.rgb(Math.round(Color.red(a) + (Color.red(b) - Color.red(a)) * t),
+                Math.round(Color.green(a) + (Color.green(b) - Color.green(a)) * t),
+                Math.round(Color.blue(a) + (Color.blue(b) - Color.blue(a)) * t));
+    }
+
+    static int dialogTheme() {
+        return dark ? android.R.style.Theme_Material_Dialog_Alert : android.R.style.Theme_Material_Light_Dialog_Alert;
+    }
 
     static final Handler MAIN = new Handler(Looper.getMainLooper());
 
@@ -52,7 +95,7 @@ final class Ui {
         GradientDrawable mask = new GradientDrawable();
         mask.setColor(Color.WHITE);
         mask.setCornerRadius(content.getCornerRadius());
-        return new RippleDrawable(ColorStateList.valueOf(0x30FFFFFF), content, mask);
+        return new RippleDrawable(ColorStateList.valueOf(RIPPLE), content, mask);
     }
 
     static TextView text(Context c, String s, float sp, int color, int weight) {
@@ -67,6 +110,7 @@ final class Ui {
     }
 
     static void buzz(Context c, int ms) {
+        if (!haptics) return;
         try {
             Vibrator v = (Vibrator) c.getSystemService(Context.VIBRATOR_SERVICE);
             if (v == null || !v.hasVibrator()) return;

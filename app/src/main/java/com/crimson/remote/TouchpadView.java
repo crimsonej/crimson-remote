@@ -37,7 +37,7 @@ public class TouchpadView extends View {
         ring.setStyle(Paint.Style.STROKE);
         ring.setStrokeWidth(Ui.dp(c, 2));
         ring.setColor(Ui.CRIMSON);
-        grid.setColor(0x14FFFFFF);
+        grid.setColor(Ui.dark ? 0x14FFFFFF : 0x1A000000);
         setBackground(Ui.shape(Ui.SURFACE, Ui.dp(c, 28), Ui.STROKE, c));
     }
 
@@ -118,7 +118,7 @@ public class TouchpadView extends View {
 
         if (alpha > 0.01f) {
             glow.setShader(new RadialGradient(x, y, radius,
-                    new int[]{(int) (alpha * 0x66) << 24 | 0xE11D48, 0x00E11D48},
+                    new int[]{(int) (alpha * 0x66) << 24 | (Ui.CRIMSON & 0xFFFFFF), Ui.CRIMSON & 0xFFFFFF},
                     null, Shader.TileMode.CLAMP));
             c.drawCircle(x, y, radius, glow);
         }

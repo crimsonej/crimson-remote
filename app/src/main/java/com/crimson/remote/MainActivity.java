@@ -77,6 +77,12 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     View tabIndicator;
     int currentTab;
 
+    // TVs found on the Wi-Fi: {ip, name, model}
+    final List<String[]> devices = new ArrayList<>();
+    volatile String connectedIp;
+    volatile boolean scanning;
+    TextView deviceBadge;
+
     LinearLayout appsRow;
     EditText typeBox;
     String typed = "";
@@ -93,9 +99,16 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             prefs.edit().putString("cid", cid).apply();
         }
         applyExtras(getIntent());
+        Ui.applyTheme(this);
         Window w = getWindow();
         w.setStatusBarColor(BG_TOP);
         w.setNavigationBarColor(BG_BOTTOM);
+        int flags = 0;
+        if (!dark) {
+            flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+        w.getDecorView().setSystemUiVisibility(flags);
         setContentView(build());
         renderApps(null);
         showTab(0, false);
@@ -140,12 +153,25 @@ public class MainActivity extends Activity implements Mqtt.Listener {
     void connect() {
         setStatus(AMBER, "Connecting", true);
         net.execute(() -> {
-            if (!ip().isEmpty() && tryConnect(ip())) return;
-            MAIN.post(() -> setStatus(AMBER, "Looking for your TV", true));
-            String found = scan();
-            if (found != null) {
-                prefs.edit().putString("ip", found).apply();
-                if (tryConnect(found)) return;
+            if (!ip().isEmpty() && tryConnect(ip())) {
+                new Thread(this::discover).start();
+                return;
+            }
+            MAIN.post(() -> setStatus(AMBER, "Looking for TVs", true));
+            discover();
+            String[] target = null;
+            synchronized (devices) {
+                for (String[] d : devices) if (d[0].equals(ip())) target = d;
+                if (target == null && !devices.isEmpty()) target = devices.get(0);
+            }
+            if (target != null) {
+                prefs.edit().putString("ip", target[0]).apply();
+                if (tryConnect(target[0])) {
+                    final String name = target[1];
+                    final int count = devices.size();
+                    if (count > 1) MAIN.post(() -> toast("Found " + count + " TVs · connected to " + name));
+                    return;
+                }
             }
             MAIN.post(() -> {
                 setStatus(RED, "TV not found · tap to retry", false);
@@ -163,6 +189,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         try {
             m.connect();
             mqtt = m;
+            connectedIp = host;
+            MAIN.post(this::refreshHeader);
             m.subscribe("/remoteapp/mobile/#");
             refresh();
             return true;
@@ -177,6 +205,106 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         action("ui_service", "sourcelist", "");
         action("ui_service", "applist", "");
         action("platform_service", "getvolume", "");
+    }
+
+    /** Finds every TV on this Wi-Fi and reads its name. Runs off the main thread. */
+    void discover() {
+        scanning = true;
+        MAIN.post(this::refreshHeader);
+        List<String> hosts = new ArrayList<>();
+        try {
+            String prefix = localPrefix();
+            if (prefix != null) {
+                ExecutorService pool = Executors.newFixedThreadPool(48);
+                for (int i = 1; i < 255; i++) {
+                    final String host = prefix + i;
+                    pool.execute(() -> {
+                        try (Socket s = new Socket()) {
+                            s.connect(new InetSocketAddress(host, PORT), 500);
+                            synchronized (hosts) { hosts.add(host); }
+                        } catch (Exception ignored) {}
+                    });
+                }
+                pool.shutdown();
+                pool.awaitTermination(10, TimeUnit.SECONDS);
+            }
+        } catch (Exception ignored) {}
+        List<String[]> found = new ArrayList<>();
+        for (String h : hosts) {
+            String[] info = describe(h);
+            found.add(new String[]{h, info[0] != null ? info[0] : "TV at " + h, info[1]});
+        }
+        String cur = connectedIp;
+        if (cur != null && !hosts.contains(cur)) found.add(0, new String[]{cur, prefs.getString("name", "Your TV"), null});
+        java.util.Collections.sort(found, (a, b) -> Integer.compare(lastOctet(a[0]), lastOctet(b[0])));
+        synchronized (devices) { devices.clear(); devices.addAll(found); }
+        scanning = false;
+        MAIN.post(() -> { refreshHeader(); if (devicesList != null) renderDevices(); });
+    }
+
+    static int lastOctet(String ip) {
+        try { return Integer.parseInt(ip.substring(ip.lastIndexOf('.') + 1)); } catch (Exception e) { return 0; }
+    }
+
+    /** {friendlyName, modelName} from the TV's media-renderer description, when it has one. */
+    String[] describe(String host) {
+        try {
+            java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                    new java.net.URL("http://" + host + ":38400/MediaServer/rendererdevicedesc.xml").openConnection();
+            c.setConnectTimeout(2000);
+            c.setReadTimeout(2500);
+            java.io.InputStream in = c.getInputStream();
+            java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096]; int n;
+            while ((n = in.read(buf)) > 0) b.write(buf, 0, n);
+            in.close();
+            String xml = b.toString("UTF-8");
+            return new String[]{tag(xml, "friendlyName"), tag(xml, "modelName")};
+        } catch (Exception e) {
+            return new String[]{null, null};
+        }
+    }
+
+    static String tag(String xml, String t) {
+        int a = xml.indexOf("<" + t + ">");
+        if (a < 0) return null;
+        int b = xml.indexOf("</" + t + ">", a);
+        if (b < 0) return null;
+        String v = xml.substring(a + t.length() + 2, b).trim();
+        return v.isEmpty() ? null : v;
+    }
+
+    /** The connected TV's own name, or its model while the name is unknown. */
+    String displayName() {
+        String key = connectedIp != null ? connectedIp : ip();
+        synchronized (devices) {
+            for (String[] d : devices) if (d[0].equals(key) && !d[1].startsWith("TV at")) return d[1];
+        }
+        return prefs.getString("name", "Your TV");
+    }
+
+    void refreshHeader() {
+        if (title != null) swap(title, displayName() + "  ▾");
+        if (deviceBadge != null) {
+            int n = devices.size();
+            deviceBadge.setText(String.valueOf(n));
+            deviceBadge.setVisibility(n > 1 ? View.VISIBLE : View.GONE);
+        }
+        if (mqtt != null && connectedIp != null && statusText != null) swap(statusText, "Connected · " + connectedIp);
+    }
+
+    /** Switches to another TV from the list. */
+    void selectDevice(String[] d) {
+        buzz(this, 12);
+        if (d[0].equals(connectedIp)) return;
+        prefs.edit().putString("ip", d[0]).apply();
+        final Mqtt m = mqtt;
+        mqtt = null;
+        connectedIp = null;
+        if (m != null) net.execute(m::close);
+        swap(nowTitle, "Connecting…");
+        swap(nowSub, d[1]);
+        connect();
     }
 
     /** Finds the TV on this network by its remote-control port. */
@@ -223,6 +351,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     @Override public void onDisconnected(String why) {
         mqtt = null;
+        connectedIp = null;
         MAIN.post(() -> setStatus(RED, "Disconnected · tap to reconnect", false));
     }
 
@@ -252,7 +381,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                 if (!model.isEmpty()) {
                     String name = ("his".equals(o.optString("vendorBrand")) ? "Hisense " : "") + model;
                     prefs.edit().putString("name", name).apply();
-                    swap(title, name);
+                    refreshHeader();
                 }
             } else if (topic.endsWith("/data/sourcelist")) {
                 sources = new JSONArray(payload);
@@ -326,7 +455,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         FrameLayout box = new FrameLayout(this);
         box.setPadding(dp(this, 24), dp(this, 8), dp(this, 24), 0);
         box.addView(code);
-        AlertDialog d = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+        AlertDialog d = new AlertDialog.Builder(this, Ui.dialogTheme())
                 .setTitle("Pair with your TV")
                 .setMessage("Type the 4-digit code showing on the TV.")
                 .setView(box)
@@ -425,7 +554,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             labels.add(label);
         }
         if (items.isEmpty()) { toast("Loading inputs…"); action("ui_service", "sourcelist", ""); return; }
-        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+        new AlertDialog.Builder(this, Ui.dialogTheme())
                 .setTitle("Choose input")
                 .setItems(labels.toArray(new String[0]), (d, which) -> {
                     JSONObject s = items.get(which);
@@ -455,30 +584,317 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         } catch (Exception ignored) {}
     }
 
+    // ---------------------------------------------------------------- sheets
+
+    /** A bottom sheet that slides up, with the app's own colours. */
+    android.app.Dialog sheet(View content) {
+        android.app.Dialog d = new android.app.Dialog(this, android.R.style.Theme_Material_Dialog_NoActionBar);
+        ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(false);
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setPadding(dp(this, 22), dp(this, 10), dp(this, 22), dp(this, 28));
+        View grab = new View(this);
+        grab.setBackground(shape(TRACK, dp(this, 2), 0, this));
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(dp(this, 40), dp(this, 4));
+        glp.gravity = Gravity.CENTER_HORIZONTAL;
+        glp.bottomMargin = dp(this, 16);
+        wrap.addView(grab, glp);
+        wrap.addView(content);
+        sv.addView(wrap);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(SHEET);
+        float r = dp(this, 26);
+        bg.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
+        sv.setBackground(bg);
+        d.setContentView(sv);
+        Window w = d.getWindow();
+        if (w != null) {
+            w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            w.setGravity(Gravity.BOTTOM);
+            w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            w.setWindowAnimations(android.R.style.Animation_InputMethod);
+            w.setDimAmount(0.55f);
+        }
+        d.show();
+        return d;
+    }
+
+    TextView sectionTitle(String t) {
+        TextView v = text(this, t.toUpperCase(), 11, FAINT, 700);
+        v.setLetterSpacing(0.14f);
+        v.setPadding(dp(this, 4), dp(this, 20), 0, dp(this, 8));
+        return v;
+    }
+
+    LinearLayout group() {
+        LinearLayout g = new LinearLayout(this);
+        g.setOrientation(LinearLayout.VERTICAL);
+        g.setBackground(shape(SURFACE, dp(this, 18), STROKE, this));
+        return g;
+    }
+
+    // ---------------------------------------------------------------- TV list
+
+    LinearLayout devicesList;
+    TextView devicesSub;
+
+    void devicesSheet() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout top = row();
+        LinearLayout titles = new LinearLayout(this);
+        titles.setOrientation(LinearLayout.VERTICAL);
+        titles.addView(text(this, "TVs", 26, TEXT, 700));
+        devicesSub = text(this, "", 13, SUB, 400);
+        titles.addView(devicesSub, margins(-2, -2, 0, 4));
+        top.addView(titles, new LinearLayout.LayoutParams(0, -2, 1));
+        final TextView refresh = text(this, "↻", 20, CRIMSON, 700);
+        refresh.setGravity(Gravity.CENTER);
+        refresh.setBackground(ripple(shape(SURFACE, dp(this, 20), STROKE, this)));
+        press(refresh, () -> {
+            if (scanning) return;
+            refresh.animate().rotationBy(360).setDuration(900).start();
+            new Thread(this::discover).start();
+            renderDevices();
+        }, false);
+        top.addView(refresh, new LinearLayout.LayoutParams(dp(this, 40), dp(this, 40)));
+        c.addView(top);
+        devicesList = new LinearLayout(this);
+        devicesList.setOrientation(LinearLayout.VERTICAL);
+        devicesList.setLayoutTransition(new LayoutTransition());
+        c.addView(devicesList, margins(-1, -2, 0, 16));
+        final android.app.Dialog d = sheet(c);
+        d.setOnDismissListener(x -> { devicesList = null; devicesSub = null; });
+        renderDevices();
+        if (devices.isEmpty() && !scanning) new Thread(this::discover).start();
+    }
+
+    void renderDevices() {
+        if (devicesList == null) return;
+        devicesSub.setText(scanning ? "Searching this Wi-Fi…" : devices.size() + " found on this Wi-Fi");
+        devicesList.removeAllViews();
+        List<String[]> list;
+        synchronized (devices) { list = new ArrayList<>(devices); }
+        if (list.isEmpty()) {
+            TextView empty = text(this, scanning ? "Looking for TVs…"
+                    : "No TVs found. Turn the TV on, keep this phone on the same Wi-Fi, then tap ↻.", 14, SUB, 400);
+            empty.setGravity(Gravity.CENTER);
+            empty.setPadding(dp(this, 10), dp(this, 30), dp(this, 10), dp(this, 30));
+            devicesList.addView(empty);
+            return;
+        }
+        for (final String[] d : list) {
+            boolean connected = d[0].equals(connectedIp);
+            LinearLayout r = row();
+            r.setPadding(dp(this, 12), dp(this, 12), dp(this, 12), dp(this, 12));
+            r.setBackground(ripple(shape(SURFACE, dp(this, 18), STROKE, this)));
+            FrameLayout ic = new FrameLayout(this);
+            ic.setBackground(connected ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 12)) : shape(SURFACE2, dp(this, 12), 0, this));
+            ic.addView(new Icon(this, Icon.TV, connected ? Color.WHITE : SUB),
+                    new FrameLayout.LayoutParams(dp(this, 22), dp(this, 22), Gravity.CENTER));
+            r.addView(ic, new LinearLayout.LayoutParams(dp(this, 46), dp(this, 46)));
+            LinearLayout t = new LinearLayout(this);
+            t.setOrientation(LinearLayout.VERTICAL);
+            t.setPadding(dp(this, 14), 0, dp(this, 8), 0);
+            t.addView(text(this, d[1], 16, TEXT, 500));
+            TextView sub = text(this, (d[2] != null ? d[2] + " · " : "") + d[0], 12, SUB, 400);
+            t.addView(sub, margins(-2, -2, 0, 4));
+            r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+            TextView state = text(this, connected ? "Connected" : "Connect", 12, connected ? GREEN : CRIMSON, 500);
+            state.setPadding(dp(this, 10), dp(this, 6), dp(this, 10), dp(this, 6));
+            state.setBackground(shape(((connected ? GREEN : CRIMSON) & 0x00FFFFFF) | 0x22000000, dp(this, 14), 0, this));
+            r.addView(state);
+            press(r, () -> { selectDevice(d); renderDevices(); }, false);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+            lp.bottomMargin = dp(this, 10);
+            devicesList.addView(r, lp);
+        }
+    }
+
+    // ---------------------------------------------------------------- settings
+
     void settings() {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(this, 24), dp(this, 8), dp(this, 24), 0);
-        final EditText ipBox = new EditText(this);
-        ipBox.setHint("TV address (found automatically)");
-        ipBox.setText(ip());
-        ipBox.setInputType(InputType.TYPE_CLASS_PHONE);
-        final EditText macBox = new EditText(this);
-        macBox.setHint("TV MAC address, for power-on");
-        macBox.setText(prefs.getString("mac", ""));
-        box.addView(ipBox);
-        box.addView(macBox);
-        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                .setTitle("TV settings")
-                .setView(box)
-                .setPositiveButton("Save", (d, w) -> {
-                    prefs.edit().putString("ip", ipBox.getText().toString().trim())
-                            .putString("mac", macBox.getText().toString().trim().toUpperCase()).apply();
-                    if (mqtt != null) { mqtt.close(); mqtt = null; }
-                    connect();
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.addView(text(this, "Settings", 26, TEXT, 700));
+
+        // TV
+        c.addView(sectionTitle("TV"));
+        LinearLayout tvg = group();
+        LinearLayout devRow = row();
+        devRow.setPadding(dp(this, 14), dp(this, 14), dp(this, 14), dp(this, 14));
+        devRow.setBackground(ripple(shape(0, dp(this, 18), 0, this)));
+        LinearLayout dt = new LinearLayout(this);
+        dt.setOrientation(LinearLayout.VERTICAL);
+        dt.addView(text(this, displayName(), 15, TEXT, 500));
+        dt.addView(text(this, connectedIp != null ? "Connected · " + connectedIp : "Not connected", 12, SUB, 400), margins(-2, -2, 0, 3));
+        devRow.addView(dt, new LinearLayout.LayoutParams(0, -2, 1));
+        devRow.addView(text(this, devices.size() + " found  ›", 12, FAINT, 400));
+        tvg.addView(devRow);
+        final EditText ipBox = field("TV address (found automatically)", ip(), InputType.TYPE_CLASS_PHONE);
+        final EditText macBox = field("TV MAC address, for power-on", prefs.getString("mac", ""), InputType.TYPE_CLASS_TEXT);
+        tvg.addView(ipBox);
+        tvg.addView(macBox);
+        TextView save = text(this, "Save TV details", 14, Color.WHITE, 500);
+        save.setGravity(Gravity.CENTER);
+        save.setBackground(ripple(gradient(CRIMSON, CRIMSON_DARK, dp(this, 22))));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-1, dp(this, 44));
+        slp.setMargins(dp(this, 14), dp(this, 6), dp(this, 14), dp(this, 14));
+        tvg.addView(save, slp);
+        c.addView(tvg);
+
+        // Appearance
+        c.addView(sectionTitle("Appearance"));
+        LinearLayout ag = group();
+        LinearLayout modes = row();
+        modes.setPadding(dp(this, 10), dp(this, 10), dp(this, 10), dp(this, 10));
+        String[] modeNames = {"System", "Light", "Dark"};
+        int[] modeIcons = {Icon.HALF, Icon.SUN, Icon.MOON};
+        int mode = prefs.getInt("appearance", 0);
+        for (int i = 0; i < 3; i++) {
+            final int m = i;
+            boolean on = mode == i;
+            LinearLayout b = new LinearLayout(this);
+            b.setOrientation(LinearLayout.VERTICAL);
+            b.setGravity(Gravity.CENTER);
+            b.setBackground(ripple(on ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 14)) : shape(SURFACE2, dp(this, 14), 0, this)));
+            b.addView(new Icon(this, modeIcons[i], on ? Color.WHITE : TEXT), new LinearLayout.LayoutParams(dp(this, 20), dp(this, 20)));
+            b.addView(text(this, modeNames[i], 12, on ? Color.WHITE : TEXT, 500), margins(-2, -2, 0, 6));
+            press(b, () -> { prefs.edit().putInt("appearance", m).apply(); recreate(); }, false);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(this, 66), 1);
+            lp.leftMargin = lp.rightMargin = dp(this, 3);
+            modes.addView(b, lp);
+        }
+        ag.addView(modes);
+        TextView acl = text(this, "Accent colour", 13, SUB, 500);
+        acl.setPadding(dp(this, 14), dp(this, 6), 0, dp(this, 10));
+        ag.addView(acl);
+        LinearLayout sw = row();
+        sw.setPadding(dp(this, 14), 0, dp(this, 14), dp(this, 16));
+        int accent = prefs.getInt("accent", 0);
+        for (int i = 0; i < ACCENT_MAIN.length; i++) {
+            final int a = i;
+            FrameLayout dot = new FrameLayout(this);
+            GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[]{ACCENT_MAIN[i], ACCENT_DEEP[i]});
+            g.setShape(GradientDrawable.OVAL);
+            if (accent == i) g.setStroke(dp(this, 3), TEXT);
+            dot.setBackground(g);
+            dot.setContentDescription(ACCENT_NAMES[i]);
+            if (accent == i) {
+                TextView tick = text(this, "✓", 14, Color.WHITE, 700);
+                tick.setGravity(Gravity.CENTER);
+                dot.addView(tick, new FrameLayout.LayoutParams(-1, -1));
+            }
+            press(dot, () -> { prefs.edit().putInt("accent", a).apply(); recreate(); }, false);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(this, 36), dp(this, 36));
+            lp.rightMargin = dp(this, 12);
+            sw.addView(dot, lp);
+        }
+        ag.addView(sw);
+        c.addView(ag);
+
+        // Feel
+        c.addView(sectionTitle("Feel"));
+        LinearLayout fg = group();
+        LinearLayout hr = row();
+        hr.setPadding(dp(this, 14), dp(this, 12), dp(this, 14), dp(this, 12));
+        hr.addView(text(this, "Vibrate on taps", 15, TEXT, 500), new LinearLayout.LayoutParams(0, -2, 1));
+        android.widget.Switch hs = new android.widget.Switch(this);
+        hs.setChecked(prefs.getBoolean("haptics", true));
+        hs.setThumbTintList(android.content.res.ColorStateList.valueOf(Color.WHITE));
+        hs.setTrackTintList(new android.content.res.ColorStateList(
+                new int[][]{{android.R.attr.state_checked}, {}}, new int[]{CRIMSON, TRACK}));
+        hs.setOnCheckedChangeListener((v, on) -> { prefs.edit().putBoolean("haptics", on).apply(); Ui.haptics = on; });
+        hr.addView(hs);
+        fg.addView(hr);
+        c.addView(fg);
+
+        // About
+        c.addView(sectionTitle("About"));
+        LinearLayout ab = group();
+        LinearLayout abr = row();
+        abr.setPadding(dp(this, 14), dp(this, 14), dp(this, 14), dp(this, 14));
+        View logo = new View(this);
+        logo.setBackground(gradient(CRIMSON, CRIMSON_DARK, dp(this, 10)));
+        abr.addView(logo, new LinearLayout.LayoutParams(dp(this, 34), dp(this, 34)));
+        LinearLayout abt = new LinearLayout(this);
+        abt.setOrientation(LinearLayout.VERTICAL);
+        abt.setPadding(dp(this, 12), 0, 0, 0);
+        abt.addView(text(this, "Crimson Remote", 15, TEXT, 500));
+        String ver = "";
+        try { ver = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception ignored) {}
+        abt.addView(text(this, "Version " + ver + " · by crimson", 12, SUB, 400), margins(-2, -2, 0, 3));
+        abr.addView(abt);
+        ab.addView(abr);
+        c.addView(ab);
+
+        final android.app.Dialog d = sheet(c);
+        press(devRow, () -> { d.dismiss(); devicesSheet(); }, false);
+        press(save, () -> {
+            prefs.edit().putString("ip", ipBox.getText().toString().trim())
+                    .putString("mac", macBox.getText().toString().trim().toUpperCase()).apply();
+            if (mqtt != null) { mqtt.close(); mqtt = null; }
+            d.dismiss();
+            toast("Saved");
+            connect();
+        }, false);
+    }
+
+    EditText field(String hint, String value, int type) {
+        EditText e = new EditText(this);
+        e.setHint(hint);
+        e.setText(value);
+        e.setInputType(type);
+        e.setTextColor(TEXT);
+        e.setHintTextColor(FAINT);
+        e.setTextSize(15);
+        e.setBackground(null);
+        e.setPadding(dp(this, 14), dp(this, 12), dp(this, 14), dp(this, 12));
+        return e;
+    }
+
+    View splash() {
+        FrameLayout f = new FrameLayout(this);
+        f.setBackgroundColor(BG_BOTTOM);
+        f.setClickable(true);
+        View glow = new View(this);
+        GradientDrawable gd = new GradientDrawable();
+        gd.setGradientType(GradientDrawable.RADIAL_GRADIENT);
+        gd.setGradientRadius(dp(this, 220));
+        gd.setColors(new int[]{(CRIMSON & 0x00FFFFFF) | 0x66000000, CRIMSON & 0x00FFFFFF});
+        glow.setBackground(gd);
+        f.addView(glow, new FrameLayout.LayoutParams(dp(this, 440), dp(this, 440), Gravity.CENTER));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER_HORIZONTAL);
+        FrameLayout mark = new FrameLayout(this);
+        mark.setBackground(gradient(CRIMSON, CRIMSON_DARK, dp(this, 22)));
+        mark.setElevation(dp(this, 10));
+        mark.addView(new Icon(this, Icon.REMOTE, Color.WHITE), new FrameLayout.LayoutParams(dp(this, 40), dp(this, 40), Gravity.CENTER));
+        col.addView(mark, new LinearLayout.LayoutParams(dp(this, 84), dp(this, 84)));
+        TextView name = text(this, "CRIMSON", 34, TEXT, 700);
+        name.setLetterSpacing(0.05f);
+        col.addView(name, margins(-2, -2, 0, 20));
+        TextView sub = text(this, "Remote", 14, SUB, 500);
+        sub.setLetterSpacing(0.2f);
+        col.addView(sub, margins(-2, -2, 0, 10));
+        f.addView(col, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
+
+        mark.setScaleX(0.6f); mark.setScaleY(0.6f); mark.setAlpha(0f);
+        name.setAlpha(0f); sub.setAlpha(0f); sub.setTranslationY(dp(this, 8));
+        glow.setScaleX(0.7f); glow.setScaleY(0.7f); glow.setAlpha(0f);
+        mark.animate().scaleX(1).scaleY(1).alpha(1).setDuration(600)
+                .setInterpolator(new android.view.animation.OvershootInterpolator(1.6f)).start();
+        glow.animate().scaleX(1.1f).scaleY(1.1f).alpha(1).setDuration(1100).start();
+        name.animate().alpha(1).setStartDelay(150).setDuration(500).start();
+        ValueAnimator spread = ValueAnimator.ofFloat(0.05f, 0.32f);
+        spread.setDuration(900);
+        spread.setInterpolator(new android.view.animation.DecelerateInterpolator());
+        spread.addUpdateListener(x -> name.setLetterSpacing((float) x.getAnimatedValue()));
+        spread.start();
+        sub.animate().alpha(1).translationY(0).setStartDelay(350).setDuration(450).start();
+        return f;
     }
 
     void askMac() {
@@ -532,11 +948,17 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         foot.setGravity(Gravity.CENTER);
         root.addView(foot, margins(-1, -2, 0, 24));
 
-        // Entrance: everything rises in gently.
+        // Splash with the Crimson name, then everything rises in gently.
         root.setAlpha(0f);
         root.setTranslationY(dp(this, 18));
-        root.animate().alpha(1f).translationY(0).setDuration(450)
-                .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+        final View splash = splash();
+        rootFrame.addView(splash, new FrameLayout.LayoutParams(-1, -1));
+        MAIN.postDelayed(() -> {
+            splash.animate().alpha(0f).scaleX(1.04f).scaleY(1.04f).setDuration(420)
+                    .withEndAction(() -> rootFrame.removeView(splash)).start();
+            root.animate().alpha(1f).translationY(0).setStartDelay(120).setDuration(480)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+        }, 1400);
         return rootFrame;
     }
 
@@ -550,14 +972,32 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         TextView brand = text(this, "CRIMSON", 12, CRIMSON, 700);
         brand.setLetterSpacing(0.32f);
         left.addView(brand);
-        title = text(this, prefs.getString("name", "Your TV"), 24, TEXT, 700);
+        title = text(this, prefs.getString("name", "Your TV") + "  ▾", 24, TEXT, 700);
         title.setPadding(0, dp(this, 6), 0, 0);
+        title.setSingleLine(true);
+        title.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        press(title, this::devicesSheet, false);
         left.addView(title);
         h.addView(left, new LinearLayout.LayoutParams(0, -2, 1));
 
-        TextView gear = text(this, "⋯", 22, SUB, 500);
-        gear.setGravity(Gravity.CENTER);
+        FrameLayout tvBtn = new FrameLayout(this);
+        tvBtn.setBackground(ripple(shape(SURFACE, dp(this, 20), STROKE, this)));
+        tvBtn.addView(new Icon(this, Icon.TV, SUB), new FrameLayout.LayoutParams(dp(this, 20), dp(this, 20), Gravity.CENTER));
+        deviceBadge = text(this, "", 10, Color.WHITE, 700);
+        deviceBadge.setGravity(Gravity.CENTER);
+        deviceBadge.setBackground(shape(CRIMSON, dp(this, 8), 0, this));
+        deviceBadge.setVisibility(View.GONE);
+        tvBtn.addView(deviceBadge, new FrameLayout.LayoutParams(dp(this, 16), dp(this, 16), Gravity.TOP | Gravity.END));
+        tvBtn.setContentDescription("TVs");
+        press(tvBtn, this::devicesSheet, false);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(dp(this, 40), dp(this, 40));
+        blp.rightMargin = dp(this, 10);
+        h.addView(tvBtn, blp);
+
+        FrameLayout gear = new FrameLayout(this);
         gear.setBackground(ripple(shape(SURFACE, dp(this, 20), STROKE, this)));
+        gear.addView(new Icon(this, Icon.GEAR, SUB), new FrameLayout.LayoutParams(dp(this, 20), dp(this, 20), Gravity.CENTER));
+        gear.setContentDescription("Settings");
         press(gear, this::settings, false);
         h.addView(gear, new LinearLayout.LayoutParams(dp(this, 40), dp(this, 40)));
 
@@ -576,7 +1016,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         statusText = text(this, "Connecting", 12, SUB, 500);
         statusText.setPadding(dp(this, 8), 0, 0, 0);
         pill.addView(statusText);
-        pill.setOnClickListener(v -> { if (mqtt == null) connect(); });
+        pill.setOnClickListener(v -> { if (mqtt == null) connect(); else devicesSheet(); });
         wrap.addView(pill, margins(-2, -2, 0, 10));
         return wrap;
     }
@@ -585,8 +1025,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(this, 18), dp(this, 16), dp(this, 18), dp(this, 12));
-        GradientDrawable bg = gradient(0xFF2A0F1A, SURFACE, dp(this, 24));
-        bg.setStroke(dp(this, 1), 0xFF3A1A26);
+        GradientDrawable bg = gradient(blend(SURFACE, CRIMSON, dark ? 0.16f : 0.12f), SURFACE, dp(this, 24));
+        bg.setStroke(dp(this, 1), blend(STROKE, CRIMSON, 0.3f));
         card.setBackground(bg);
 
         TextView label = text(this, "ON THE TV", 10, CRIMSON, 700);
@@ -607,7 +1047,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         volBar.setMax(100);
         volBar.setProgressTintList(android.content.res.ColorStateList.valueOf(CRIMSON));
         volBar.setThumbTintList(android.content.res.ColorStateList.valueOf(Color.WHITE));
-        volBar.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(0xFF3A3A48));
+        volBar.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(TRACK));
         volBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar s, int p, boolean user) {
                 if (!user) return;
@@ -805,7 +1245,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         int size = dp(this, 194);
         FrameLayout f = new FrameLayout(this);
         GradientDrawable ring = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0xFF22222C, SURFACE});
+                new int[]{RAISED, SURFACE});
         ring.setShape(GradientDrawable.OVAL);
         ring.setStroke(dp(this, 1), STROKE);
         f.setBackground(ring);
@@ -819,7 +1259,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             o.setShape(GradientDrawable.OVAL);
             o.setColor(0);
             t.setBackground(new android.graphics.drawable.RippleDrawable(
-                    android.content.res.ColorStateList.valueOf(0x30FFFFFF), o, null));
+                    android.content.res.ColorStateList.valueOf(RIPPLE), o, null));
             final String k = arrows[i][1];
             press(t, () -> key(k), true);
             f.addView(t, new FrameLayout.LayoutParams(dp(this, 60), dp(this, 60), g[i]));
@@ -1246,6 +1686,68 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             c.drawPath(sp, f);
             c.drawArc(new RectF(w * 0.40f, h * 0.30f, w * 0.75f, h * 0.70f), -50, 100, false, l);
             c.drawArc(new RectF(w * 0.40f, h * 0.15f, w * 0.95f, h * 0.85f), -50, 100, false, l);
+        }
+    }
+
+    /** Small line icons drawn in code so they match on every phone. */
+    static class Icon extends View {
+        static final int TV = 0, GEAR = 1, SUN = 2, MOON = 3, HALF = 4, REMOTE = 5;
+        final int kind;
+        final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG), f = new Paint(Paint.ANTI_ALIAS_FLAG);
+        Icon(Context c, int kind, int color) {
+            super(c);
+            this.kind = kind;
+            p.setColor(color); p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(dp(c, 1.8f));
+            p.setStrokeCap(Paint.Cap.ROUND); p.setStrokeJoin(Paint.Join.ROUND);
+            f.setColor(color); f.setStyle(Paint.Style.FILL);
+        }
+        @Override protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight(), s = p.getStrokeWidth();
+            switch (kind) {
+                case TV:
+                    c.drawRoundRect(new RectF(s, h * 0.18f, w - s, h * 0.78f), w * 0.12f, w * 0.12f, p);
+                    c.drawLine(w * 0.32f, h - s, w * 0.68f, h - s, p);
+                    break;
+                case GEAR: {
+                    float cx = w / 2, cy = h / 2, r = w * 0.22f;
+                    c.drawCircle(cx, cy, r, p);
+                    for (int i = 0; i < 8; i++) {
+                        double a = Math.PI / 4 * i;
+                        c.drawLine(cx + (float) Math.cos(a) * r * 1.45f, cy + (float) Math.sin(a) * r * 1.45f,
+                                cx + (float) Math.cos(a) * r * 2.0f, cy + (float) Math.sin(a) * r * 2.0f, p);
+                    }
+                    break;
+                }
+                case SUN: {
+                    float cx = w / 2, cy = h / 2;
+                    c.drawCircle(cx, cy, w * 0.2f, f);
+                    for (int i = 0; i < 8; i++) {
+                        double a = Math.PI / 4 * i;
+                        c.drawLine(cx + (float) Math.cos(a) * w * 0.32f, cy + (float) Math.sin(a) * w * 0.32f,
+                                cx + (float) Math.cos(a) * w * 0.45f, cy + (float) Math.sin(a) * w * 0.45f, p);
+                    }
+                    break;
+                }
+                case MOON: {
+                    android.graphics.Path m = new android.graphics.Path();
+                    m.addCircle(w * 0.5f, h * 0.5f, w * 0.4f, android.graphics.Path.Direction.CW);
+                    android.graphics.Path cut = new android.graphics.Path();
+                    cut.addCircle(w * 0.7f, h * 0.32f, w * 0.32f, android.graphics.Path.Direction.CW);
+                    m.op(cut, android.graphics.Path.Op.DIFFERENCE);
+                    c.drawPath(m, f);
+                    break;
+                }
+                case HALF:
+                    c.drawCircle(w / 2, h / 2, w * 0.4f, p);
+                    c.drawArc(new RectF(w * 0.1f, h * 0.1f, w * 0.9f, h * 0.9f), 90, 180, true, f);
+                    break;
+                case REMOTE:
+                    c.drawRoundRect(new RectF(w * 0.3f, h * 0.05f, w * 0.7f, h * 0.95f), w * 0.1f, w * 0.1f, p);
+                    c.drawCircle(w / 2, h * 0.27f, w * 0.08f, f);
+                    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++)
+                        c.drawCircle(w * (0.42f + 0.16f * j), h * (0.55f + 0.16f * i), w * 0.035f, f);
+                    break;
+            }
         }
     }
 }
