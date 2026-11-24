@@ -111,7 +111,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         w.getDecorView().setSystemUiVisibility(flags);
         setContentView(build());
         renderApps(null);
-        showTab(0, false);
+
         refreshHeader();
     }
 
@@ -256,7 +256,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             @Override public void onState(String t, String sub) { MAIN.post(() -> { swap(nowTitle, t); swap(nowSub, sub); }); }
             @Override public void onVolume(int v) { MAIN.post(() -> showVolume(v)); }
             @Override public void onApps(JSONArray apps) { MAIN.post(() -> renderApps(apps)); }
-            @Override public void onSources(JSONArray src) { MAIN.post(() -> sources = src); }
+            @Override public void onSources(JSONArray src) { MAIN.post(() -> { sources = src; renderInputs(); }); }
             @Override public void onModel(String model) {
                 TvStore.Tv t = currentTv();
                 if (t != null) { t.model = model.trim(); store.save(t); }
@@ -443,6 +443,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                 }
             } else if (topic.endsWith("/data/sourcelist")) {
                 sources = new JSONArray(payload);
+                renderInputs();
             } else if (topic.endsWith("/data/applist")) {
                 renderApps(new JSONArray(payload));
             } else if (topic.contains("volumechange") || topic.endsWith("/data/volume") || topic.endsWith("/ui_service/volume")) {
@@ -901,6 +902,29 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             modes.addView(b, lp);
         }
         ag.addView(modes);
+        TextView stl = text(this, "Style", 13, SUB, 500);
+        stl.setPadding(dp(this, 14), dp(this, 6), 0, dp(this, 6));
+        ag.addView(stl);
+        int curStyle = prefs.getInt("style", 0);
+        for (int i = 0; i < 3; i++) {
+            final int st = i;
+            LinearLayout sr = row();
+            sr.setPadding(dp(this, 14), dp(this, 10), dp(this, 14), dp(this, 10));
+            sr.setBackground(ripple(shape(0, dp(this, 14), 0, this)));
+            View sw = new View(this);
+            int[] previews = {blend(0xFF1A0B11, CRIMSON, 0.45f), 0xFF17171E, 0xFF000000};
+            sw.setBackground(shape(previews[i], dp(this, 10), STROKE, this));
+            sr.addView(sw, new LinearLayout.LayoutParams(dp(this, 40), dp(this, 40)));
+            LinearLayout tx = new LinearLayout(this);
+            tx.setOrientation(LinearLayout.VERTICAL);
+            tx.setPadding(dp(this, 12), 0, 0, 0);
+            tx.addView(text(this, STYLE_NAMES[i], 15, TEXT, 500));
+            tx.addView(text(this, STYLE_BLURBS[i], 12, SUB, 400), margins(-2, -2, 0, 2));
+            sr.addView(tx, new LinearLayout.LayoutParams(0, -2, 1));
+            sr.addView(text(this, curStyle == i ? "●" : "○", 18, curStyle == i ? CRIMSON : FAINT, 500));
+            press(sr, () -> { prefs.edit().putInt("style", st).apply(); recreate(); }, false);
+            ag.addView(sr);
+        }
         TextView acl = text(this, "Accent colour", 13, SUB, 500);
         acl.setPadding(dp(this, 14), dp(this, 6), 0, dp(this, 10));
         ag.addView(acl);
@@ -1040,131 +1064,171 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     // ================================================================ layout
 
+    // Screens and the bottom tab bar.
+    FrameLayout screensFrame;
+    View[] screens = new View[3];
+    TextView[] navLabels = new TextView[3];
+    Icon[] navIcons = new Icon[3];
+    int screen;
+    TextView screenLabel;
+    View headerDot;
+    LinearLayout banner;
+    FrameLayout padHolder;
+    boolean touchpadMode;
+
     View build() {
         FrameLayout rootFrame = new FrameLayout(this);
-        rootFrame.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{BG_TOP, BG_BOTTOM, BG_BOTTOM}));
+        rootFrame.addView(new GlowBackground(this), new FrameLayout.LayoutParams(-1, -1));
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setVerticalScrollBarEnabled(false);
-        rootFrame.addView(scroll);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.addView(header(), new LinearLayout.LayoutParams(-1, -2));
+        screensFrame = new FrameLayout(this);
+        col.addView(screensFrame, new LinearLayout.LayoutParams(-1, 0, 1));
+        col.addView(navBar(), new LinearLayout.LayoutParams(-1, -2));
+        rootFrame.addView(col, new FrameLayout.LayoutParams(-1, -1));
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(this, 20), dp(this, 14), dp(this, 20), dp(this, 28));
-        scroll.addView(root);
-
-        root.addView(header());
-        root.addView(nowCard(), margins(-1, -2, 0, 16));
-        root.addView(tabs(), margins(-1, dp(this, 46), 0, 18));
-
-        pages = new FrameLayout(this);
-        pageViews[0] = remotePage();
-        pageViews[1] = touchpadPage();
-        pageViews[2] = keyboardPage();
-        pageViews[3] = castPage();
-        for (View v : pageViews) pages.addView(v, new FrameLayout.LayoutParams(-1, -2));
-        root.addView(pages, margins(-1, -2, 0, 18));
-
-        TextView appsTitle = text(this, "APPS", 11, FAINT, 500);
-        appsTitle.setLetterSpacing(0.18f);
-        root.addView(appsTitle, margins(-2, -2, 0, 22));
-        HorizontalScrollView hs = new HorizontalScrollView(this);
-        hs.setHorizontalScrollBarEnabled(false);
-        hs.setClipToPadding(false);
-        appsRow = new LinearLayout(this);
-        appsRow.setOrientation(LinearLayout.HORIZONTAL);
-        appsRow.setPadding(0, dp(this, 10), 0, dp(this, 4));
-        hs.addView(appsRow);
-        root.addView(hs);
-
-        root.addView(bridgeCard(), margins(-1, -2, 0, 24));
-
-        TextView foot = text(this, "Crimson Remote", 11, FAINT, 400);
-        foot.setGravity(Gravity.CENTER);
-        root.addView(foot, margins(-1, -2, 0, 24));
+        screens[0] = scrolled(remoteScreen());
+        screens[1] = scrolled(appsScreen());
+        screens[2] = scrolled(castScreen());
+        for (View v : screens) screensFrame.addView(v, new FrameLayout.LayoutParams(-1, -1));
+        showScreen(0, false);
 
         // Splash with the Crimson name, then everything rises in gently.
-        root.setAlpha(0f);
-        root.setTranslationY(dp(this, 18));
+        col.setAlpha(0f);
+        col.setTranslationY(dp(this, 18));
         final View splash = splash();
         rootFrame.addView(splash, new FrameLayout.LayoutParams(-1, -1));
         MAIN.postDelayed(() -> {
             splash.animate().alpha(0f).scaleX(1.04f).scaleY(1.04f).setDuration(420)
                     .withEndAction(() -> rootFrame.removeView(splash)).start();
-            root.animate().alpha(1f).translationY(0).setStartDelay(120).setDuration(480)
+            col.animate().alpha(1f).translationY(0).setStartDelay(120).setDuration(480)
                     .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
-        }, 1400);
+        }, 1300);
         return rootFrame;
     }
 
-    View header() {
-        LinearLayout h = new LinearLayout(this);
-        h.setOrientation(LinearLayout.HORIZONTAL);
-        h.setGravity(Gravity.CENTER_VERTICAL);
+    ScrollView scrolled(View content) {
+        ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(false);
+        sv.setClipToPadding(false);
+        sv.addView(content);
+        return sv;
+    }
 
+    LinearLayout screenColumn() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setPadding(dp(this, 20), dp(this, 6), dp(this, 20), dp(this, 28));
+        c.setLayoutTransition(new LayoutTransition());
+        return c;
+    }
+
+    View header() {
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setPadding(dp(this, 20), dp(this, 14), dp(this, 20), dp(this, 10));
+        wrap.setLayoutTransition(new LayoutTransition());
+
+        LinearLayout h = row();
         LinearLayout left = new LinearLayout(this);
         left.setOrientation(LinearLayout.VERTICAL);
-        TextView brand = text(this, "CRIMSON", 12, CRIMSON, 700);
-        brand.setLetterSpacing(0.32f);
-        left.addView(brand);
+        screenLabel = text(this, "CRIMSON · REMOTE", 11, CRIMSON, 700);
+        screenLabel.setLetterSpacing(0.24f);
+        left.addView(screenLabel);
+        LinearLayout nameRow = row();
+        headerDot = new View(this);
+        headerDot.setBackground(shape(FAINT, dp(this, 5), 0, this));
+        nameRow.addView(headerDot, new LinearLayout.LayoutParams(dp(this, 10), dp(this, 10)));
         title = text(this, "No TV yet  ▾", 24, TEXT, 700);
-        title.setPadding(0, dp(this, 6), 0, 0);
+        title.setPadding(dp(this, 8), 0, 0, 0);
         title.setSingleLine(true);
         title.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        press(title, this::devicesSheet, false);
-        left.addView(title);
+        nameRow.addView(title);
+        press(nameRow, this::devicesSheet, false);
+        nameRow.setContentDescription("Choose TV");
+        left.addView(nameRow, margins(-2, -2, 0, 6));
         h.addView(left, new LinearLayout.LayoutParams(0, -2, 1));
 
-        FrameLayout tvBtn = new FrameLayout(this);
-        tvBtn.setBackground(ripple(shape(SURFACE, dp(this, 20), STROKE, this)));
-        tvBtn.addView(new Icon(this, Icon.TV, SUB), new FrameLayout.LayoutParams(dp(this, 20), dp(this, 20), Gravity.CENTER));
-        deviceBadge = text(this, "", 10, Color.WHITE, 700);
-        deviceBadge.setGravity(Gravity.CENTER);
-        deviceBadge.setBackground(shape(CRIMSON, dp(this, 8), 0, this));
-        deviceBadge.setVisibility(View.GONE);
-        tvBtn.addView(deviceBadge, new FrameLayout.LayoutParams(dp(this, 16), dp(this, 16), Gravity.TOP | Gravity.END));
-        tvBtn.setContentDescription("TVs");
-        press(tvBtn, this::devicesSheet, false);
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(dp(this, 40), dp(this, 40));
-        blp.rightMargin = dp(this, 10);
-        h.addView(tvBtn, blp);
-
         FrameLayout gear = new FrameLayout(this);
-        gear.setBackground(ripple(shape(SURFACE, dp(this, 20), STROKE, this)));
+        gear.setBackground(ripple(shape(SURFACE2, dp(this, 22), STROKE, this)));
         gear.addView(new Icon(this, Icon.GEAR, SUB), new FrameLayout.LayoutParams(dp(this, 20), dp(this, 20), Gravity.CENTER));
         gear.setContentDescription("Settings");
         press(gear, this::settings, false);
-        h.addView(gear, new LinearLayout.LayoutParams(dp(this, 40), dp(this, 40)));
-
-        LinearLayout wrap = new LinearLayout(this);
-        wrap.setOrientation(LinearLayout.VERTICAL);
+        h.addView(gear, new LinearLayout.LayoutParams(dp(this, 44), dp(this, 44)));
         wrap.addView(h);
 
-        // Connection card: what is happening right now, and the buttons to change it.
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(this, 14), dp(this, 12), dp(this, 14), dp(this, 12));
-        card.setBackground(shape(SURFACE, dp(this, 18), STROKE, this));
-        card.setLayoutTransition(new LayoutTransition());
-        LinearLayout line = row();
+        // Banner: only shown when the connection needs attention.
+        banner = new LinearLayout(this);
+        banner.setOrientation(LinearLayout.HORIZONTAL);
+        banner.setGravity(Gravity.CENTER_VERTICAL);
+        banner.setPadding(dp(this, 12), dp(this, 10), dp(this, 12), dp(this, 10));
+        banner.setBackground(shape(SURFACE, dp(this, 20), STROKE, this));
         statusDot = new View(this);
         statusDot.setBackground(shape(AMBER, dp(this, 5), 0, this));
-        line.addView(statusDot, new LinearLayout.LayoutParams(dp(this, 10), dp(this, 10)));
+        banner.addView(statusDot, new LinearLayout.LayoutParams(dp(this, 10), dp(this, 10)));
         LinearLayout texts = new LinearLayout(this);
         texts.setOrientation(LinearLayout.VERTICAL);
-        texts.setPadding(dp(this, 10), 0, 0, 0);
+        texts.setPadding(dp(this, 10), 0, dp(this, 8), 0);
         statusText = text(this, "Starting", 14, TEXT, 500);
         texts.addView(statusText);
         statusDetail = text(this, "", 12, SUB, 400);
         texts.addView(statusDetail, margins(-2, -2, 0, 2));
-        line.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
-        card.addView(line);
+        banner.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
         connButtons = row();
-        card.addView(connButtons, margins(-1, -2, 0, 10));
-        wrap.addView(card, margins(-1, -2, 0, 12));
+        banner.addView(connButtons, new LinearLayout.LayoutParams(-2, -2));
+        wrap.addView(banner, margins(-1, -2, 0, 12));
         return wrap;
+    }
+
+    View navBar() {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setPadding(dp(this, 8), dp(this, 6), dp(this, 8), dp(this, 10));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(style == 0 ? (dark ? 0xE6101015 : 0xEFFFFFFF) : SURFACE);
+        bg.setStroke(dp(this, 1), STROKE);
+        bar.setBackground(bg);
+        String[] names = {"Remote", "Apps", "Cast"};
+        int[] icons = {Icon.REMOTE, Icon.GRID, Icon.CASTTV};
+        for (int i = 0; i < 3; i++) {
+            final int idx = i;
+            LinearLayout item = new LinearLayout(this);
+            item.setOrientation(LinearLayout.VERTICAL);
+            item.setGravity(Gravity.CENTER);
+            item.setPadding(0, dp(this, 6), 0, dp(this, 4));
+            item.setBackground(ripple(shape(0, dp(this, 16), 0, this)));
+            navIcons[i] = new Icon(this, icons[i], SUB);
+            item.addView(navIcons[i], new LinearLayout.LayoutParams(dp(this, 24), dp(this, 24)));
+            navLabels[i] = text(this, names[i], 11, SUB, 500);
+            item.addView(navLabels[i], margins(-2, -2, 0, 4));
+            item.setOnClickListener(v -> { buzz(this, 8); showScreen(idx, true); });
+            bar.addView(item, new LinearLayout.LayoutParams(0, -2, 1));
+        }
+        return bar;
+    }
+
+    void showScreen(int idx, boolean animate) {
+        int from = screen;
+        screen = idx;
+        String[] labels = {"REMOTE", "APPS", "CAST"};
+        screenLabel.setText("CRIMSON · " + labels[idx]);
+        for (int i = 0; i < 3; i++) {
+            boolean on = i == idx;
+            navLabels[i].setTextColor(on ? CRIMSON : SUB);
+            navIcons[i].setColor(on ? CRIMSON : SUB);
+            View v = screens[i];
+            if (on) {
+                v.setVisibility(View.VISIBLE);
+                if (animate && from != idx) {
+                    v.setAlpha(0f);
+                    v.setTranslationX((idx > from ? 1 : -1) * dp(this, 24));
+                    v.animate().alpha(1f).translationX(0).setDuration(240)
+                            .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+                }
+            } else v.setVisibility(View.GONE);
+        }
+        if (idx == 2) startCastPolling();
     }
 
     View nowCard() {
@@ -1217,117 +1281,88 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         return card;
     }
 
-    View tabs() {
-        FrameLayout f = new FrameLayout(this);
-        f.setBackground(shape(SURFACE, dp(this, 23), STROKE, this));
-        f.setPadding(dp(this, 4), dp(this, 4), dp(this, 4), dp(this, 4));
-        tabIndicator = new View(this);
-        tabIndicator.setBackground(gradient(CRIMSON, CRIMSON_DARK, dp(this, 19)));
-        f.addView(tabIndicator, new FrameLayout.LayoutParams(0, -1));
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        String[] names = {"Remote", "Touchpad", "Keys", "Cast"};
-        for (int i = 0; i < 4; i++) {
-            final int idx = i;
-            TextView t = text(this, names[i], 14, SUB, 500);
-            t.setGravity(Gravity.CENTER);
-            t.setOnClickListener(v -> { buzz(this, 8); showTab(idx, true); });
-            tabLabels[i] = t;
-            row.addView(t, new LinearLayout.LayoutParams(0, -1, 1));
-        }
-        f.addView(row, new FrameLayout.LayoutParams(-1, -1));
-        f.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
-            int w = (r - l - dp(this, 8)) / 4;
-            ViewGroup.LayoutParams lp = tabIndicator.getLayoutParams();
-            if (lp.width != w) {
-                lp.width = w;
-                tabIndicator.setLayoutParams(lp);
-                tabIndicator.setTranslationX(currentTab * w);
-            }
-        });
-        return f;
-    }
+    // ---------------------------------------------------------------- Remote screen
 
-    void showTab(int idx, boolean animate) {
-        int from = currentTab;
-        currentTab = idx;
-        int w = tabIndicator.getWidth();
-        if (animate) {
-            tabIndicator.animate().translationX(idx * w).setDuration(280)
-                    .setInterpolator(new android.view.animation.OvershootInterpolator(0.9f)).start();
-        } else tabIndicator.setTranslationX(idx * w);
-        for (int i = 0; i < 4; i++) tabLabels[i].setTextColor(i == idx ? Color.WHITE : SUB);
+    View remoteScreen() {
+        LinearLayout c = screenColumn();
+        c.addView(nowCard());
 
-        for (int i = 0; i < 4; i++) {
-            final View v = pageViews[i];
-            if (i == idx) {
-                v.setVisibility(View.VISIBLE);
-                if (animate) {
-                    v.setAlpha(0f);
-                    v.setTranslationX((idx > from ? 1 : -1) * dp(this, 30));
-                    v.animate().alpha(1f).translationX(0).setDuration(260)
-                            .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
-                }
-            } else v.setVisibility(View.GONE);
-        }
-        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
-        if (idx == 2 && typeBox != null) {
-            typeBox.requestFocus();
-            typeBox.postDelayed(() -> imm.showSoftInput(typeBox, 0), 250);
-        } else if (typeBox != null) {
-            imm.hideSoftInputFromWindow(typeBox.getWindowToken(), 0);
-        }
-    }
-
-    // ---------------------------------------------------------------- Remote page
-
-    View remotePage() {
-        LinearLayout p = new LinearLayout(this);
-        p.setOrientation(LinearLayout.VERTICAL);
-        p.setLayoutTransition(new LayoutTransition());
+        LinearLayout controls = new LinearLayout(this);
+        controls.setOrientation(LinearLayout.VERTICAL);
+        controls.setPadding(dp(this, 16), dp(this, 20), dp(this, 16), dp(this, 20));
+        controls.setBackground(shape(SURFACE, dp(this, 30), STROKE, this));
+        controls.setLayoutTransition(new LayoutTransition());
+        pages = new FrameLayout(this);   // dimmed while not connected
 
         LinearLayout top = row();
-        View pw = round(new PowerIcon(this), 0, dp(this, 62), true);
+        View pw = round(new PowerIcon(this), 0, dp(this, 58), true);
         press(pw, this::power, false);
+        pw.setContentDescription("Power");
         top.addView(pw);
         top.addView(flex());
-        TextView input = text(this, "Input", 15, TEXT, 500);
-        input.setGravity(Gravity.CENTER);
-        input.setBackground(ripple(shape(SURFACE2, dp(this, 26), STROKE, this)));
-        press(input, this::chooseInput, false);
-        top.addView(input, new LinearLayout.LayoutParams(dp(this, 116), dp(this, 52)));
+        top.addView(labeledKey(Icon.INPUT, "Input", this::chooseInput));
         top.addView(flex());
-        View mute = round(new MuteIcon(this), SURFACE2, dp(this, 62), false);
-        press(mute, () -> key("KEY_MUTE"), false);
-        top.addView(mute);
-        p.addView(top);
+        top.addView(labeledKey(Icon.MUTE, "Mute", () -> key("KEY_MUTE")));
+        top.addView(flex());
+        top.addView(labeledKey(Icon.KEYBOARD, "Keyboard", this::keyboardSheet));
+        controls.addView(top);
 
-        LinearLayout mid = row();
-        mid.addView(rocker("VOL", "KEY_VOLUMEUP", "KEY_VOLUMEDOWN"));
-        mid.addView(flex());
-        mid.addView(dpad());
-        mid.addView(flex());
-        mid.addView(rocker("CH", "KEY_CHANNELUP", "KEY_CHANNELDOWN"));
-        p.addView(mid, margins(-1, -2, 0, 22));
+        // D-pad or touchpad, in the same spot.
+        touchpadMode = prefs.getBoolean("padMode", false);
+        LinearLayout sw = row();
+        sw.setPadding(dp(this, 4), dp(this, 4), dp(this, 4), dp(this, 4));
+        sw.setBackground(shape(SURFACE2, dp(this, 20), 0, this));
+        final TextView dpadBtn = text(this, "D-pad", 13, TEXT, 500);
+        final TextView padBtn = text(this, "Touchpad", 13, TEXT, 500);
+        for (TextView t : new TextView[]{dpadBtn, padBtn}) {
+            t.setGravity(Gravity.CENTER);
+            t.setPadding(dp(this, 18), 0, dp(this, 18), 0);
+            sw.addView(t, new LinearLayout.LayoutParams(-2, dp(this, 34)));
+        }
+        LinearLayout.LayoutParams swl = new LinearLayout.LayoutParams(-2, -2);
+        swl.gravity = Gravity.CENTER_HORIZONTAL;
+        swl.topMargin = dp(this, 22);
+        controls.addView(sw, swl);
+
+        padHolder = new FrameLayout(this);
+        controls.addView(padHolder, margins(-1, -2, 0, 20));
+        final Runnable paintMode = () -> {
+            dpadBtn.setBackground(touchpadMode ? null : gradient(CRIMSON, CRIMSON_DARK, dp(this, 17)));
+            dpadBtn.setTextColor(touchpadMode ? SUB : Color.WHITE);
+            padBtn.setBackground(touchpadMode ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 17)) : null);
+            padBtn.setTextColor(touchpadMode ? Color.WHITE : SUB);
+            padHolder.removeAllViews();
+            View v = touchpadMode ? touchpadArea() : dpadArea();
+            v.setAlpha(0f);
+            padHolder.addView(v, new FrameLayout.LayoutParams(-1, -2));
+            v.animate().alpha(1f).setDuration(220).start();
+        };
+        dpadBtn.setOnClickListener(v -> { buzz(this, 8); touchpadMode = false; prefs.edit().putBoolean("padMode", false).apply(); paintMode.run(); });
+        padBtn.setOnClickListener(v -> { buzz(this, 8); touchpadMode = true; prefs.edit().putBoolean("padMode", true).apply(); paintMode.run(); });
+        paintMode.run();
 
         LinearLayout nav = row();
-        String[][] navKeys = {{"Back", "KEY_RETURNS"}, {"Home", "KEY_HOME"}, {"Menu", "KEY_MENU"}, {"Exit", "KEY_EXIT"}};
-        for (String[] k : navKeys) {
-            TextView t = text(this, k[0], 13, TEXT, 500);
-            t.setGravity(Gravity.CENTER);
-            t.setBackground(ripple(shape(SURFACE2, dp(this, 24), STROKE, this)));
-            press(t, () -> key(k[1]), false);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(this, 48), 1);
+        Object[][] navKeys = {{Icon.BACK, "Back", "KEY_RETURNS"}, {Icon.HOME, "Home", "KEY_HOME"}, {Icon.MENU, "Menu", "KEY_MENU"}, {Icon.DOTS, "More", null}};
+        for (Object[] k : navKeys) {
+            LinearLayout b = new LinearLayout(this);
+            b.setOrientation(LinearLayout.VERTICAL);
+            b.setGravity(Gravity.CENTER);
+            b.setBackground(ripple(shape(SURFACE2, dp(this, 18), 0, this)));
+            b.addView(new Icon(this, (int) k[0], TEXT), new LinearLayout.LayoutParams(dp(this, 20), dp(this, 20)));
+            b.addView(text(this, (String) k[1], 11, SUB, 500), margins(-2, -2, 0, 5));
+            final String code = (String) k[2];
+            press(b, () -> { if (code != null) key(code); else moreSheet(); }, false);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(this, 60), 1);
             lp.leftMargin = lp.rightMargin = dp(this, 4);
-            nav.addView(t, lp);
+            nav.addView(b, lp);
         }
-        p.addView(nav, margins(-1, -2, 0, 22));
+        controls.addView(nav, margins(-1, -2, 0, 22));
 
         LinearLayout media = new LinearLayout(this);
         media.setOrientation(LinearLayout.HORIZONTAL);
         media.setPadding(dp(this, 6), dp(this, 6), dp(this, 6), dp(this, 6));
-        media.setBackground(shape(SURFACE, dp(this, 28), STROKE, this));
-        media.addView(mediaBtn("⏮", "KEY_BACK"), weight());
+        media.setBackground(shape(SURFACE2, dp(this, 28), 0, this));
+        media.addView(mediaBtn("◀◀", "KEY_BACK"), weight());
         final TextView pp = text(this, "❚❚", 16, TEXT, 500);
         pp.setGravity(Gravity.CENTER);
         pp.setBackground(ripple(shape(0, dp(this, 24), 0, this)));
@@ -1337,54 +1372,71 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             swap(pp, playing ? "❚❚" : "▶");
         }, false);
         media.addView(pp, weight());
-        media.addView(mediaBtn("⏭", "KEY_FORWARDS"), weight());
-        p.addView(media, margins(-1, dp(this, 58), 0, 14));
+        media.addView(mediaBtn("▶▶", "KEY_FORWARDS"), weight());
+        controls.addView(media, margins(-1, dp(this, 54), 0, 14));
 
-        // Expandable extras: numbers, colour keys, info, subtitles.
-        final LinearLayout extra = new LinearLayout(this);
-        extra.setOrientation(LinearLayout.VERTICAL);
-        extra.setVisibility(View.GONE);
-        String[][] nums = {{"1", "2", "3"}, {"4", "5", "6"}, {"7", "8", "9"}, {"Info", "0", "Subs"}};
-        for (String[] r : nums) {
-            LinearLayout rr = row();
-            for (String n : r) {
-                String k = n.equals("Info") ? "KEY_INFO" : n.equals("Subs") ? "KEY_SUBTITLE" : "KEY_" + n;
-                TextView t = text(this, n, n.length() == 1 ? 20 : 13, TEXT, 500);
-                t.setGravity(Gravity.CENTER);
-                t.setBackground(ripple(shape(SURFACE2, dp(this, 18), STROKE, this)));
-                press(t, () -> key(k), false);
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(this, 50), 1);
-                lp.setMargins(dp(this, 4), dp(this, 4), dp(this, 4), dp(this, 4));
-                rr.addView(t, lp);
-            }
-            extra.addView(rr);
-        }
-        LinearLayout colours = row();
-        int[] cs = {0xFFEF4444, 0xFF22C55E, 0xFFEAB308, 0xFF3B82F6};
-        String[] ck = {"KEY_RED", "KEY_GREEN", "KEY_YELLOW", "KEY_BLUE"};
-        for (int i = 0; i < 4; i++) {
-            View c = new View(this);
-            c.setBackground(ripple(shape(cs[i], dp(this, 10), 0, this)));
-            final String k = ck[i];
-            press(c, () -> key(k), false);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(this, 22), 1);
-            lp.setMargins(dp(this, 8), dp(this, 10), dp(this, 8), 0);
-            colours.addView(c, lp);
-        }
-        extra.addView(colours);
+        c.addView(controls, margins(-1, -2, 0, 18));
+        pages = null;
+        controlsCard = controls;
+        return c;
+    }
 
-        final TextView more = text(this, "More buttons  ⌄", 13, SUB, 500);
-        more.setGravity(Gravity.CENTER);
-        more.setPadding(0, dp(this, 12), 0, dp(this, 6));
-        more.setOnClickListener(v -> {
-            boolean open = extra.getVisibility() != View.VISIBLE;
-            extra.setVisibility(open ? View.VISIBLE : View.GONE);
-            more.setText(open ? "Fewer buttons  ⌃" : "More buttons  ⌄");
-            buzz(this, 8);
+    View controlsCard;
+
+    View labeledKey(int icon, String label, Runnable r) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER_HORIZONTAL);
+        FrameLayout k = new FrameLayout(this);
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(SURFACE2);
+        g.setStroke(dp(this, 1), STROKE);
+        k.setBackground(ripple(g));
+        k.addView(new Icon(this, icon, TEXT), new FrameLayout.LayoutParams(dp(this, 22), dp(this, 22), Gravity.CENTER));
+        col.addView(k, new LinearLayout.LayoutParams(dp(this, 52), dp(this, 52)));
+        col.addView(text(this, label, 11, SUB, 500), margins(-2, -2, 0, 6));
+        press(col, r, false);
+        col.setContentDescription(label);
+        return col;
+    }
+
+    View dpadArea() {
+        LinearLayout mid = row();
+        mid.addView(rocker("VOL", "KEY_VOLUMEUP", "KEY_VOLUMEDOWN"));
+        mid.addView(flex());
+        mid.addView(dpad());
+        mid.addView(flex());
+        mid.addView(rocker("CH", "KEY_CHANNELUP", "KEY_CHANNELDOWN"));
+        return mid;
+    }
+
+    View touchpadArea() {
+        FrameLayout f = new FrameLayout(this);
+        TouchpadView pad = new TouchpadView(this);
+        pad.setListener(new TouchpadView.Listener() {
+            @Override public void onStep(String k) { key(k); }
+            @Override public void onTap() { key("KEY_OK"); }
         });
-        p.addView(more);
-        p.addView(extra);
-        return p;
+        f.addView(pad, new FrameLayout.LayoutParams(-1, dp(this, 250)));
+        TextView hint = text(this, "Swipe to move · tap to select", 12, FAINT, 400);
+        f.addView(hint, new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
+        ((FrameLayout.LayoutParams) hint.getLayoutParams()).bottomMargin = dp(this, 12);
+        final TextView pointer = text(this, "⌖", 18, SUB, 500);
+        pointer.setGravity(Gravity.CENTER);
+        pointer.setBackground(ripple(shape(SURFACE, dp(this, 17), STROKE, this)));
+        pointer.setContentDescription("Pointer mode");
+        press(pointer, () -> {
+            key("KEY_LEFTMOUSEKEYS");
+            pointerMode = !pointerMode;
+            pointer.setBackground(ripple(pointerMode ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 17)) : shape(SURFACE, dp(this, 17), STROKE, this)));
+            pointer.setTextColor(pointerMode ? Color.WHITE : SUB);
+            toast(pointerMode ? "Pointer on" : "Pointer off");
+        }, false);
+        FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams(dp(this, 34), dp(this, 34), Gravity.TOP | Gravity.END);
+        plp.setMargins(0, dp(this, 10), dp(this, 10), 0);
+        f.addView(pointer, plp);
+        return f;
     }
 
     View dpad() {
@@ -1464,109 +1516,119 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         return f;
     }
 
-    // ---------------------------------------------------------------- Touchpad page
-
-    View touchpadPage() {
-        LinearLayout p = new LinearLayout(this);
-        p.setOrientation(LinearLayout.VERTICAL);
-        TouchpadView pad = new TouchpadView(this);
-        pad.setListener(new TouchpadView.Listener() {
-            @Override public void onStep(String k) { key(k); }
-            @Override public void onTap() { key("KEY_OK"); }
-        });
-        p.addView(pad, new LinearLayout.LayoutParams(-1, dp(this, 330)));
-
-        TextView hint = text(this, "Swipe to move · Tap to select", 12, FAINT, 400);
-        hint.setGravity(Gravity.CENTER);
-        p.addView(hint, margins(-1, -2, 0, 10));
-
-        LinearLayout r = row();
-        final TextView pointer = chip("Pointer mode");
-        press(pointer, () -> {
-            key("KEY_LEFTMOUSEKEYS");
-            pointerMode = !pointerMode;
-            pointer.setBackground(ripple(pointerMode
-                    ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 22))
-                    : shape(SURFACE2, dp(this, 22), STROKE, this)));
-            toast(pointerMode ? "Pointer on: swipe moves the cursor" : "Pointer off");
-        }, false);
-        r.addView(pointer, chipLp(1));
-        TextView back = chip("Back");
-        press(back, () -> key("KEY_RETURNS"), false);
-        r.addView(back, chipLp(1));
-        TextView home = chip("Home");
-        press(home, () -> key("KEY_HOME"), false);
-        r.addView(home, chipLp(1));
-        p.addView(r, margins(-1, -2, 0, 14));
-        return p;
-    }
-
-    // ---------------------------------------------------------------- Keyboard page
-
-    // ---------------------------------------------------------------- Cast page
+    // ---------------------------------------------------------------- Cast screen
 
     static final int PICK_MEDIA = 41;
     Caster caster;
-    TextView castStatus;
+    LinearLayout nowCast;
+    TextView castTitle, castState, castTimes;
+    SeekBar castSeek;
+    TextView castPlayBtn;
+    boolean castSeeking;
+    String castKind = "";
 
-    View castPage() {
-        LinearLayout p = new LinearLayout(this);
-        p.setOrientation(LinearLayout.VERTICAL);
+    View castScreen() {
+        LinearLayout c = screenColumn();
 
-        p.addView(castCard(Icon.PLAY, "Photos, videos & music",
-                "Send a file from this phone to the TV over Wi-Fi.", "Choose a file", () -> {
-                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                    i.addCategory(Intent.CATEGORY_OPENABLE);
-                    i.setType("*/*");
-                    i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*", "audio/*"});
-                    startActivityForResult(i, PICK_MEDIA);
-                }));
+        // Now casting: only shown while something is on the TV.
+        nowCast = new LinearLayout(this);
+        nowCast.setOrientation(LinearLayout.VERTICAL);
+        nowCast.setPadding(dp(this, 16), dp(this, 16), dp(this, 16), dp(this, 16));
+        nowCast.setBackground(shape(SURFACE, dp(this, 24), STROKE, this));
+        TextView label = text(this, "NOW CASTING", 11, FAINT, 700);
+        label.setLetterSpacing(0.16f);
+        nowCast.addView(label);
+        castTitle = text(this, "", 16, TEXT, 500);
+        castTitle.setSingleLine(true);
+        castTitle.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        nowCast.addView(castTitle, margins(-1, -2, 0, 6));
+        castState = text(this, "", 12, SUB, 400);
+        nowCast.addView(castState, margins(-1, -2, 0, 2));
+        castSeek = new SeekBar(this);
+        castSeek.setProgressTintList(android.content.res.ColorStateList.valueOf(CRIMSON));
+        castSeek.setThumbTintList(android.content.res.ColorStateList.valueOf(Color.WHITE));
+        castSeek.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(TRACK));
+        castSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(SeekBar s, int p, boolean u) {}
+            public void onStartTrackingTouch(SeekBar s) { castSeeking = true; }
+            public void onStopTrackingTouch(SeekBar s) {
+                castSeeking = false;
+                final int to = s.getProgress();
+                new Thread(() -> { try { caster.seek(to); } catch (Exception ignored) {} }).start();
+            }
+        });
+        nowCast.addView(castSeek, margins(-1, -2, 0, 10));
+        castTimes = text(this, "", 11, SUB, 400);
+        nowCast.addView(castTimes);
+        LinearLayout cb = row();
+        castPlayBtn = text(this, "Pause", 14, Color.WHITE, 500);
+        castPlayBtn.setGravity(Gravity.CENTER);
+        castPlayBtn.setBackground(ripple(gradient(CRIMSON, CRIMSON_DARK, dp(this, 23))));
+        press(castPlayBtn, () -> castControl("toggle"), false);
+        cb.addView(castPlayBtn, chipLp(1));
+        TextView stop = chip("Stop casting");
+        press(stop, () -> castControl("stop"), false);
+        cb.addView(stop, chipLp(1));
+        nowCast.addView(cb, margins(-1, -2, 0, 12));
+        nowCast.setVisibility(View.GONE);
+        c.addView(nowCast, margins(-1, -2, 0, 0));
 
-        LinearLayout controls = row();
-        String[][] c = {{"Play", "play"}, {"Pause", "pause"}, {"Stop", "stop"}};
-        for (String[] b : c) {
-            TextView t = chip(b[0]);
-            press(t, () -> castControl(b[1]), false);
-            controls.addView(t, chipLp(1));
-        }
-        p.addView(controls, margins(-1, -2, 0, 10));
-        castStatus = text(this, "Nothing casting", 12, FAINT, 400);
-        castStatus.setGravity(Gravity.CENTER);
-        p.addView(castStatus, margins(-1, -2, 0, 8));
+        // Pick something to cast.
+        LinearLayout pick = row();
+        pick.setPadding(dp(this, 16), dp(this, 16), dp(this, 16), dp(this, 16));
+        pick.setBackground(ripple(shape(SURFACE, dp(this, 24), STROKE, this)));
+        FrameLayout ic = new FrameLayout(this);
+        ic.setBackground(gradient(CRIMSON, CRIMSON_DARK, dp(this, 18)));
+        ic.addView(new Icon(this, Icon.PLAY, Color.WHITE), new FrameLayout.LayoutParams(dp(this, 24), dp(this, 24), Gravity.CENTER));
+        pick.addView(ic, new LinearLayout.LayoutParams(dp(this, 58), dp(this, 58)));
+        LinearLayout pt = new LinearLayout(this);
+        pt.setOrientation(LinearLayout.VERTICAL);
+        pt.setPadding(dp(this, 16), 0, 0, 0);
+        pt.addView(text(this, "Photos, videos & music", 17, TEXT, 700));
+        pt.addView(text(this, "Pick something to show on the TV", 13, SUB, 400), margins(-2, -2, 0, 4));
+        pick.addView(pt, new LinearLayout.LayoutParams(0, -2, 1));
+        pick.addView(text(this, "›", 22, FAINT, 400));
+        press(pick, () -> {
+            if (connState != ST_CONNECTED) { toast("Connect to a TV first"); return; }
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*", "audio/*"});
+            startActivityForResult(i, PICK_MEDIA);
+        }, false);
+        c.addView(pick, margins(-1, -2, 0, 18));
 
-        p.addView(castCard(Icon.MIRROR, "Mirror this phone",
-                "Shows your phone screen on the TV. On the TV open Screen Share (Anyview Cast) first.",
-                "Open screen cast", this::openScreenCast), margins(-1, -2, 0, 16));
+        c.addView(sectionTitle("More ways"));
+        LinearLayout ways = group();
+        ways.addView(wayRow(Icon.MIRROR, "Mirror this phone", "Uses the TV's Screen Share (Miracast)", this::openScreenCast));
+        ways.addView(wayRow(Icon.DESKTOP, "Crimson Desktop", "A desktop on the TV while mirroring", this::openDesktop));
+        c.addView(ways);
 
-        p.addView(castCard(Icon.DESKTOP, "Crimson Desktop",
-                "A desktop on the TV while your phone becomes the trackpad. Start mirroring first.",
-                "Open desktop", this::openDesktop), margins(-1, -2, 0, 12));
-        return p;
+        c.addView(sectionTitle("For an iPhone browser"));
+        c.addView(bridgeCard());
+        return c;
     }
 
-    View castCard(int icon, String title, String desc, String action, Runnable run) {
-        LinearLayout card = group();
-        card.setPadding(dp(this, 16), dp(this, 16), dp(this, 16), dp(this, 16));
-        LinearLayout top = row();
+    View wayRow(int icon, String title, String sub, Runnable r) {
+        LinearLayout row = row();
+        row.setPadding(dp(this, 14), dp(this, 14), dp(this, 14), dp(this, 14));
+        row.setBackground(ripple(shape(0, dp(this, 18), 0, this)));
         FrameLayout ic = new FrameLayout(this);
-        ic.setBackground(shape(CRIMSON_SOFT, dp(this, 12), 0, this));
-        ic.addView(new Icon(this, icon, CRIMSON), new FrameLayout.LayoutParams(dp(this, 22), dp(this, 22), Gravity.CENTER));
-        top.addView(ic, new LinearLayout.LayoutParams(dp(this, 44), dp(this, 44)));
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(CRIMSON_SOFT);
+        ic.setBackground(g);
+        ic.addView(new Icon(this, icon, CRIMSON), new FrameLayout.LayoutParams(dp(this, 20), dp(this, 20), Gravity.CENTER));
+        row.addView(ic, new LinearLayout.LayoutParams(dp(this, 40), dp(this, 40)));
         LinearLayout t = new LinearLayout(this);
         t.setOrientation(LinearLayout.VERTICAL);
         t.setPadding(dp(this, 14), 0, 0, 0);
-        t.addView(text(this, title, 16, TEXT, 500));
-        TextView d = text(this, desc, 12, SUB, 400);
-        d.setLineSpacing(0, 1.15f);
-        t.addView(d, margins(-1, -2, 0, 4));
-        top.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
-        card.addView(top);
-        TextView go = text(this, action, 14, Color.WHITE, 500);
-        go.setGravity(Gravity.CENTER);
-        go.setBackground(ripple(gradient(CRIMSON, CRIMSON_DARK, dp(this, 22))));
-        press(go, run, false);
-        card.addView(go, margins(-1, dp(this, 44), 0, 14));
-        return card;
+        t.addView(text(this, title, 15, TEXT, 500));
+        t.addView(text(this, sub, 12, SUB, 400), margins(-2, -2, 0, 2));
+        row.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+        row.addView(text(this, "›", 20, FAINT, 400));
+        press(row, r, false);
+        return row;
     }
 
     @Override protected void onActivityResult(int req, int res, Intent data) {
@@ -1576,29 +1638,77 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         final String tv = connectedIp != null ? connectedIp : currentTv() != null ? currentTv().ip : "";
         if (tv.isEmpty()) { toast("Connect to a TV first"); return; }
         if (caster == null) caster = new Caster(this);
-        castStatus.setText("Sending to the TV…");
+        nowCast.setVisibility(View.VISIBLE);
+        castTitle.setText(caster.displayName(uri));
+        castState.setText("Sending to the TV…");
+        castSeek.setVisibility(View.GONE);
+        castTimes.setVisibility(View.GONE);
         new Thread(() -> {
             try {
                 caster.cast(tv, uri);
-                String name = caster.displayName(uri);
-                MAIN.post(() -> { castStatus.setText("Casting " + caster.kind() + ": " + name); toast("Casting to the TV"); });
+                castKind = caster.kind();
+                MAIN.post(() -> { castState.setText(castKind.equals("photo") ? "Showing on the TV" : "Playing on the TV"); startCastPolling(); });
             } catch (Exception e) {
-                MAIN.post(() -> { castStatus.setText(String.valueOf(e.getMessage())); toast(String.valueOf(e.getMessage())); });
+                MAIN.post(() -> castState.setText(String.valueOf(e.getMessage())));
             }
         }).start();
     }
 
+    boolean castPaused;
+
     void castControl(String what) {
-        if (caster == null) { toast("Choose a file to cast first"); return; }
+        if (caster == null) return;
         buzz(this, 10);
         new Thread(() -> {
             try {
-                if (what.equals("play")) caster.play(); else if (what.equals("pause")) caster.pause(); else caster.stop();
-                if (what.equals("stop")) MAIN.post(() -> castStatus.setText("Nothing casting"));
+                if (what.equals("stop")) {
+                    caster.stop();
+                    MAIN.post(() -> nowCast.setVisibility(View.GONE));
+                } else if (castPaused) { caster.play(); castPaused = false; }
+                else { caster.pause(); castPaused = true; }
+                MAIN.post(() -> castPlayBtn.setText(castPaused ? "Play" : "Pause"));
             } catch (Exception e) {
                 MAIN.post(() -> toast(String.valueOf(e.getMessage())));
             }
         }).start();
+    }
+
+    final Runnable castPoll = new Runnable() {
+        @Override public void run() {
+            if (caster == null || nowCast == null || nowCast.getVisibility() != View.VISIBLE || screen != 2) return;
+            new Thread(() -> {
+                String state = caster.transportState();
+                long[] pos = castKind.equals("photo") ? null : caster.position();
+                MAIN.post(() -> {
+                    if (state != null) {
+                        castPaused = state.equals("PAUSED_PLAYBACK");
+                        castPlayBtn.setText(castPaused ? "Play" : "Pause");
+                        castPlayBtn.setVisibility(castKind.equals("photo") ? View.GONE : View.VISIBLE);
+                        if (state.equals("STOPPED") && pos != null && pos[1] > 0 && pos[0] >= pos[1] - 2) castState.setText("Finished");
+                        else castState.setText(state.equals("PLAYING") ? (castKind.equals("photo") ? "Showing on the TV" : "Playing on the TV")
+                                : castPaused ? "Paused" : state.equals("TRANSITIONING") ? "Loading on the TV…" : castState.getText().toString());
+                    }
+                    if (pos != null && pos[1] > 0) {
+                        castSeek.setVisibility(View.VISIBLE);
+                        castTimes.setVisibility(View.VISIBLE);
+                        castSeek.setMax((int) pos[1]);
+                        if (!castSeeking) castSeek.setProgress((int) pos[0]);
+                        castTimes.setText(clock(pos[0]) + " / " + clock(pos[1]));
+                    }
+                });
+            }).start();
+            MAIN.postDelayed(this, 1000);
+        }
+    };
+
+    void startCastPolling() {
+        MAIN.removeCallbacks(castPoll);
+        MAIN.post(castPoll);
+    }
+
+    static String clock(long s) {
+        return s >= 3600 ? String.format(java.util.Locale.US, "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+                : String.format(java.util.Locale.US, "%d:%02d", s / 60, s % 60);
     }
 
     /** Opens the phone's own screen-cast (Miracast) page. */
@@ -1621,51 +1731,95 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         startActivity(new Intent(this, DesktopActivity.class));
     }
 
-    View keyboardPage() {
-        LinearLayout p = new LinearLayout(this);
-        p.setOrientation(LinearLayout.VERTICAL);
+    // ---------------------------------------------------------------- Keyboard and More
 
-        TextView info = text(this, "Select a search box on the TV, then type here.", 13, SUB, 400);
-        p.addView(info);
-
+    void keyboardSheet() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.addView(text(this, "Type on the TV", 22, TEXT, 700));
+        c.addView(text(this, "Select a search box on the TV first.", 13, SUB, 400), margins(-2, -2, 0, 6));
+        LinearLayout r = row();
+        typed = "";
         typeBox = new EditText(this);
         typeBox.setTextColor(TEXT);
         typeBox.setHintTextColor(FAINT);
-        typeBox.setHint("Type to send to the TV…");
+        typeBox.setHint("Start typing…");
         typeBox.setTextSize(18);
-        typeBox.setPadding(dp(this, 18), dp(this, 16), dp(this, 18), dp(this, 16));
-        typeBox.setBackground(shape(SURFACE, dp(this, 20), STROKE, this));
+        typeBox.setPadding(dp(this, 16), dp(this, 14), dp(this, 16), dp(this, 14));
+        typeBox.setBackground(shape(SURFACE, dp(this, 16), STROKE, this));
         typeBox.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         typeBox.setImeOptions(EditorInfo.IME_ACTION_SEND);
         typeBox.addTextChangedListener(new TextWatcher() {
-            public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
-            public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            public void beforeTextChanged(CharSequence s, int a, int b, int c2) {}
+            public void onTextChanged(CharSequence s, int a, int b, int c2) {}
             public void afterTextChanged(Editable e) { syncTyped(e.toString()); }
         });
         typeBox.setOnEditorActionListener((v, id, ev) -> {
             if (id == EditorInfo.IME_ACTION_SEND || (ev != null && ev.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
                 input("Lit_ENTER");
                 buzz(this, 15);
+                typed = "";
+                typeBox.setText("");
                 return true;
             }
             return false;
         });
-        p.addView(typeBox, margins(-1, -2, 0, 12));
+        r.addView(typeBox, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView bk = text(this, "⌫", 18, TEXT, 500);
+        bk.setGravity(Gravity.CENTER);
+        bk.setBackground(ripple(shape(SURFACE2, dp(this, 26), STROKE, this)));
+        bk.setContentDescription("Backspace");
+        press(bk, () -> input("Lit_BACKSPACE"), true);
+        LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(dp(this, 52), dp(this, 52));
+        bl.leftMargin = dp(this, 10);
+        r.addView(bk, bl);
+        c.addView(r, margins(-1, -2, 0, 14));
+        android.app.Dialog d = sheet(c);
+        if (d.getWindow() != null) d.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE
+                | android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        typeBox.requestFocus();
+    }
 
-        LinearLayout r = row();
-        TextView clear = chip("Clear");
-        press(clear, () -> typeBox.setText(""), false);
-        r.addView(clear, chipLp(1));
-        TextView bksp = chip("⌫");
-        press(bksp, () -> input("Lit_BACKSPACE"), true);
-        r.addView(bksp, chipLp(1));
-        TextView enter = chip("Enter");
-        enter.setTextColor(Color.WHITE);
-        enter.setBackground(ripple(gradient(CRIMSON, CRIMSON_DARK, dp(this, 22))));
-        press(enter, () -> input("Lit_ENTER"), false);
-        r.addView(enter, chipLp(1));
-        p.addView(r, margins(-1, -2, 0, 12));
-        return p;
+    void moreSheet() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.addView(text(this, "More buttons", 22, TEXT, 700));
+        String[][] nums = {{"1", "2", "3"}, {"4", "5", "6"}, {"7", "8", "9"}, {"Info", "0", "Subtitles"}};
+        for (String[] r : nums) {
+            LinearLayout rr = row();
+            for (String n : r) {
+                String k = n.equals("Info") ? "KEY_INFO" : n.equals("Subtitles") ? "KEY_SUBTITLE" : "KEY_" + n;
+                TextView t = text(this, n, n.length() == 1 ? 22 : 13, TEXT, 500);
+                t.setGravity(Gravity.CENTER);
+                t.setBackground(ripple(shape(SURFACE, dp(this, 18), STROKE, this)));
+                press(t, () -> key(k), false);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(this, 56), 1);
+                lp.setMargins(dp(this, 5), dp(this, 5), dp(this, 5), dp(this, 5));
+                rr.addView(t, lp);
+            }
+            c.addView(rr, margins(-1, -2, 0, 4));
+        }
+        LinearLayout colours = row();
+        int[] cs = {0xFFEF4444, 0xFF22C55E, 0xFFEAB308, 0xFF3B82F6};
+        String[] ck = {"KEY_RED", "KEY_GREEN", "KEY_YELLOW", "KEY_BLUE"};
+        String[] cn = {"Red", "Green", "Yellow", "Blue"};
+        for (int i = 0; i < 4; i++) {
+            View col = new View(this);
+            col.setBackground(ripple(shape(cs[i], dp(this, 12), 0, this)));
+            col.setContentDescription(cn[i]);
+            final String k = ck[i];
+            press(col, () -> key(k), false);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(this, 30), 1);
+            lp.setMargins(dp(this, 6), dp(this, 12), dp(this, 6), 0);
+            colours.addView(col, lp);
+        }
+        c.addView(colours);
+        TextView exit = text(this, "Exit", 14, TEXT, 500);
+        exit.setGravity(Gravity.CENTER);
+        exit.setBackground(ripple(shape(SURFACE, dp(this, 18), STROKE, this)));
+        press(exit, () -> key("KEY_EXIT"), false);
+        c.addView(exit, margins(-1, dp(this, 50), 0, 18));
+        sheet(c);
     }
 
     /** Sends only what changed: backspaces for removed text, letters for new text. */
@@ -1674,29 +1828,48 @@ public class MainActivity extends Activity implements Mqtt.Listener {
         while (common < now.length() && common < typed.length() && now.charAt(common) == typed.charAt(common)) common++;
         for (int i = common; i < typed.length(); i++) input("Lit_BACKSPACE");
         for (int i = common; i < now.length(); i++) {
-            char c = now.charAt(i);
-            input(c == ' ' ? "Lit_SPACE" : "Lit_" + c);
+            char ch = now.charAt(i);
+            input(ch == ' ' ? "Lit_SPACE" : "Lit_" + ch);
         }
         typed = now;
     }
 
     // ---------------------------------------------------------------- apps
 
+    LinearLayout inputsList;
+    TextView appsEmpty;
+
+    View appsScreen() {
+        LinearLayout c = screenColumn();
+        appsEmpty = text(this, "Your TV's apps show here once it's connected.", 14, SUB, 400);
+        appsEmpty.setGravity(Gravity.CENTER);
+        appsEmpty.setPadding(dp(this, 20), dp(this, 40), dp(this, 20), dp(this, 40));
+        appsEmpty.setBackground(shape(SURFACE, dp(this, 24), STROKE, this));
+        c.addView(appsEmpty);
+        appsRow = new LinearLayout(this);   // the grid
+        appsRow.setOrientation(LinearLayout.VERTICAL);
+        c.addView(appsRow, margins(-1, -2, 0, 4));
+        inputsList = new LinearLayout(this);
+        inputsList.setOrientation(LinearLayout.VERTICAL);
+        c.addView(inputsList, margins(-1, -2, 0, 10));
+        return c;
+    }
+
     void renderApps(JSONArray list) {
         appsRow.removeAllViews();
-        if (list == null || list.length() == 0) {
-            TextView empty = text(this, "Your TV's apps show here once it's connected.", 13, FAINT, 400);
-            empty.setPadding(dp(this, 4), dp(this, 8), 0, dp(this, 8));
-            appsRow.addView(empty);
-            return;
-        }
+        boolean empty = list == null || list.length() == 0;
+        appsEmpty.setVisibility(empty ? View.VISIBLE : View.GONE);
+        if (empty) { appsEmpty.setText(connState == ST_CONNECTED ? "Loading your TV's apps…" : "Your TV's apps show here once it's connected."); return; }
+        appsRow.addView(sectionTitle("On your TV"));
         int[] tints = {0xFFE11D48, 0xFFF97316, 0xFF8B5CF6, 0xFF06B6D4, 0xFF22C55E, 0xFFEAB308, 0xFF3B82F6, 0xFFEC4899};
-        for (int i = 0; i < list.length() && i < 16; i++) {
+        LinearLayout line = null;
+        int shown = 0;
+        for (int i = 0; i < list.length() && shown < 24; i++) {
             final JSONObject app = list.optJSONObject(i);
             if (app == null) continue;
             String name = app.optString("name").trim().replaceAll("\\s+\\d+(\\.\\d+)*$", "");
             if (name.isEmpty()) continue;
-
+            if (shown % 4 == 0) { line = row(); line.setGravity(Gravity.TOP); appsRow.addView(line, margins(-1, -2, 0, 12)); }
             LinearLayout tile = new LinearLayout(this);
             tile.setOrientation(LinearLayout.VERTICAL);
             tile.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -1717,7 +1890,7 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             logo.setPadding(pad, pad, pad, pad);
             logo.setAlpha(0f);
             badgeBox.addView(logo, new FrameLayout.LayoutParams(-1, -1));
-            tile.addView(badgeBox, new LinearLayout.LayoutParams(dp(this, 58), dp(this, 58)));
+            tile.addView(badgeBox, new LinearLayout.LayoutParams(dp(this, 64), dp(this, 64)));
             final String domain = AppIcons.domain(name, app.optString("url"));
             final String tvIcon = app.optString("icon", "");
             if (domain != null || !tvIcon.isEmpty()) {
@@ -1741,11 +1914,53 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             tile.addView(label, new LinearLayout.LayoutParams(dp(this, 70), -2));
             ((LinearLayout.LayoutParams) label.getLayoutParams()).topMargin = dp(this, 6);
             press(tile, () -> launchApp(app), false);
-            appsRow.addView(tile);
-
+            line.addView(tile, new LinearLayout.LayoutParams(0, -2, 1));
             tile.setAlpha(0f);
-            tile.setTranslationY(dp(this, 10));
-            tile.animate().alpha(1f).translationY(0).setStartDelay(i * 35L).setDuration(260).start();
+            tile.setScaleX(0.9f); tile.setScaleY(0.9f);
+            tile.animate().alpha(1f).scaleX(1f).scaleY(1f).setStartDelay(shown * 25L).setDuration(260).start();
+            shown++;
+        }
+        while (line != null && shown % 4 != 0) { line.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1)); shown++; }
+    }
+
+    void renderInputs() {
+        if (inputsList == null) return;
+        inputsList.removeAllViews();
+        if (sources.length() == 0) return;
+        inputsList.addView(sectionTitle("Inputs"));
+        for (int i = 0; i < sources.length(); i++) {
+            final JSONObject s = sources.optJSONObject(i);
+            if (s == null) continue;
+            String name = s.optString("displayname", s.optString("sourcename"));
+            String raw = s.optString("sourcename");
+            boolean sig = "1".equals(s.optString("is_signal"));
+            LinearLayout r = row();
+            r.setPadding(dp(this, 12), dp(this, 12), dp(this, 12), dp(this, 12));
+            r.setBackground(ripple(shape(SURFACE, dp(this, 18), STROKE, this)));
+            FrameLayout ic = new FrameLayout(this);
+            GradientDrawable g = new GradientDrawable();
+            g.setShape(GradientDrawable.OVAL);
+            g.setColor(CRIMSON_SOFT);
+            ic.setBackground(g);
+            ic.addView(new Icon(this, Icon.INPUT, CRIMSON), new FrameLayout.LayoutParams(dp(this, 18), dp(this, 18), Gravity.CENTER));
+            r.addView(ic, new LinearLayout.LayoutParams(dp(this, 38), dp(this, 38)));
+            LinearLayout t = new LinearLayout(this);
+            t.setOrientation(LinearLayout.VERTICAL);
+            t.setPadding(dp(this, 14), 0, 0, 0);
+            t.addView(text(this, name, 15, TEXT, 500));
+            if (!name.equals(raw)) t.addView(text(this, raw, 12, SUB, 400), margins(-2, -2, 0, 2));
+            r.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+            r.addView(text(this, sig ? "Signal" : "No signal", 11, sig ? GREEN : FAINT, 500));
+            press(r, () -> {
+                try {
+                    JSONObject o = new JSONObject().put("sourceid", s.optString("sourceid")).put("sourcename", s.optString("sourcename"));
+                    if (driver != null) driver.source(s); else action("ui_service", "changesource", o.toString());
+                    toast("Switching to " + s.optString("displayname"));
+                } catch (Exception ignored) {}
+            }, false);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+            lp.bottomMargin = dp(this, 10);
+            inputsList.addView(r, lp);
         }
     }
 
@@ -1921,6 +2136,8 @@ public class MainActivity extends Activity implements Mqtt.Listener {
             default: color = FAINT; head = "Starting"; detail = "";
         }
         statusDot.setBackground(shape(color, dp(this, 5), 0, this));
+        if (headerDot != null) headerDot.setBackground(shape(color, dp(this, 5), 0, this));
+        if (banner != null) banner.setVisibility(connState == ST_CONNECTED ? View.GONE : View.VISIBLE);
         if (pulse != null) { pulse.cancel(); pulse = null; statusDot.setAlpha(1f); }
         if (busy) pulse = Ui.pulse(statusDot);
         swap(statusText, head);
@@ -1956,17 +2173,18 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                 connButton("Switch TV", false, this::devicesSheet);
         }
         boolean live = connState == ST_CONNECTED;
-        if (pages != null) pages.animate().alpha(live ? 1f : 0.45f).setDuration(200).start();
+        if (controlsCard != null) controlsCard.animate().alpha(live ? 1f : 0.5f).setDuration(200).start();
     }
 
     void connButton(String label, boolean primary, Runnable r) {
+        if (connButtons.getChildCount() >= (primary ? 2 : 1) && !primary) return;   // the banner keeps one main action
         TextView b = text(this, label, 13, primary ? Color.WHITE : TEXT, 500);
         b.setGravity(Gravity.CENTER);
         b.setPadding(dp(this, 12), 0, dp(this, 12), 0);
         b.setBackground(ripple(primary ? gradient(CRIMSON, CRIMSON_DARK, dp(this, 18)) : shape(SURFACE2, dp(this, 18), STROKE, this)));
         press(b, r, false);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(this, 38), 1);
-        lp.rightMargin = dp(this, 8);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(this, 34));
+        lp.leftMargin = dp(this, 6);
         connButtons.addView(b, lp);
     }
 
@@ -2097,8 +2315,10 @@ public class MainActivity extends Activity implements Mqtt.Listener {
 
     /** Small line icons drawn in code so they match on every phone. */
     static class Icon extends View {
-        static final int TV = 0, GEAR = 1, SUN = 2, MOON = 3, HALF = 4, REMOTE = 5, PLAY = 6, MIRROR = 7, DESKTOP = 8;
+        static final int TV = 0, GEAR = 1, SUN = 2, MOON = 3, HALF = 4, REMOTE = 5, PLAY = 6, MIRROR = 7, DESKTOP = 8,
+                GRID = 9, CASTTV = 10, INPUT = 11, MUTE = 12, KEYBOARD = 13, BACK = 14, HOME = 15, MENU = 16, DOTS = 17;
         final int kind;
+        void setColor(int c) { p.setColor(c); f.setColor(c); invalidate(); }
         final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG), f = new Paint(Paint.ANTI_ALIAS_FLAG);
         Icon(Context c, int kind, int color) {
             super(c);
@@ -2161,6 +2381,63 @@ public class MainActivity extends Activity implements Mqtt.Listener {
                     c.drawRoundRect(new RectF(s, h * 0.12f, w - s, h * 0.72f), w * 0.08f, w * 0.08f, p);
                     c.drawLine(w * 0.5f, h * 0.72f, w * 0.5f, h * 0.88f, p);
                     c.drawLine(w * 0.3f, h * 0.9f, w * 0.7f, h * 0.9f, p);
+                    break;
+                case GRID: {
+                    float g = w * 0.1f, cell = (w - g * 3) / 2;
+                    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++)
+                        c.drawRoundRect(new RectF(g + j * (cell + g), g + i * (cell + g), g + j * (cell + g) + cell, g + i * (cell + g) + cell), w * 0.06f, w * 0.06f, f);
+                    break;
+                }
+                case CASTTV: {
+                    c.drawRoundRect(new RectF(s, h * 0.15f, w - s, h * 0.75f), w * 0.1f, w * 0.1f, p);
+                    android.graphics.Path t = new android.graphics.Path();
+                    t.moveTo(w * 0.42f, h * 0.32f); t.lineTo(w * 0.64f, h * 0.45f); t.lineTo(w * 0.42f, h * 0.58f); t.close();
+                    c.drawPath(t, f);
+                    c.drawLine(w * 0.34f, h * 0.92f, w * 0.66f, h * 0.92f, p);
+                    break;
+                }
+                case INPUT:
+                    c.drawRoundRect(new RectF(s, h * 0.18f, w * 0.72f, h * 0.72f), w * 0.08f, w * 0.08f, p);
+                    c.drawRoundRect(new RectF(w * 0.3f, h * 0.36f, w - s, h * 0.9f), w * 0.08f, w * 0.08f, p);
+                    break;
+                case MUTE: {
+                    android.graphics.Path sp = new android.graphics.Path();
+                    sp.moveTo(w * 0.08f, h * 0.36f); sp.lineTo(w * 0.30f, h * 0.36f); sp.lineTo(w * 0.55f, h * 0.12f);
+                    sp.lineTo(w * 0.55f, h * 0.88f); sp.lineTo(w * 0.30f, h * 0.64f); sp.lineTo(w * 0.08f, h * 0.64f); sp.close();
+                    c.drawPath(sp, f);
+                    c.drawLine(w * 0.70f, h * 0.36f, w * 0.94f, h * 0.64f, p);
+                    c.drawLine(w * 0.94f, h * 0.36f, w * 0.70f, h * 0.64f, p);
+                    break;
+                }
+                case KEYBOARD: {
+                    c.drawRoundRect(new RectF(s, h * 0.22f, w - s, h * 0.8f), w * 0.1f, w * 0.1f, p);
+                    for (int i = 0; i < 4; i++) c.drawCircle(w * (0.22f + 0.185f * i), h * 0.42f, w * 0.035f, f);
+                    c.drawLine(w * 0.3f, h * 0.62f, w * 0.7f, h * 0.62f, p);
+                    break;
+                }
+                case BACK: {
+                    android.graphics.Path a = new android.graphics.Path();
+                    a.moveTo(w * 0.38f, h * 0.2f); a.lineTo(w * 0.15f, h * 0.42f); a.lineTo(w * 0.38f, h * 0.64f);
+                    c.drawPath(a, p);
+                    android.graphics.Path b2 = new android.graphics.Path();
+                    b2.moveTo(w * 0.16f, h * 0.42f); b2.lineTo(w * 0.62f, h * 0.42f);
+                    b2.quadTo(w * 0.88f, h * 0.42f, w * 0.88f, h * 0.64f); b2.quadTo(w * 0.88f, h * 0.86f, w * 0.62f, h * 0.86f);
+                    b2.lineTo(w * 0.45f, h * 0.86f);
+                    c.drawPath(b2, p);
+                    break;
+                }
+                case HOME: {
+                    android.graphics.Path hm = new android.graphics.Path();
+                    hm.moveTo(w * 0.12f, h * 0.48f); hm.lineTo(w * 0.5f, h * 0.14f); hm.lineTo(w * 0.88f, h * 0.48f);
+                    c.drawPath(hm, p);
+                    c.drawRoundRect(new RectF(w * 0.24f, h * 0.42f, w * 0.76f, h * 0.88f), w * 0.06f, w * 0.06f, p);
+                    break;
+                }
+                case MENU:
+                    for (int i = 0; i < 3; i++) c.drawLine(w * 0.15f, h * (0.28f + 0.22f * i), w * 0.85f, h * (0.28f + 0.22f * i), p);
+                    break;
+                case DOTS:
+                    for (int i = 0; i < 3; i++) c.drawCircle(w * (0.22f + 0.28f * i), h * 0.5f, w * 0.07f, f);
                     break;
                 case REMOTE:
                     c.drawRoundRect(new RectF(w * 0.3f, h * 0.05f, w * 0.7f, h * 0.95f), w * 0.1f, w * 0.1f, p);

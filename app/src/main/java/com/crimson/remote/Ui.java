@@ -28,6 +28,12 @@ final class Ui {
     static final int GREEN = 0xFF22C55E, AMBER = 0xFFF59E0B, RED = 0xFFEF4444;
     static boolean dark = true;
     static boolean haptics = true;
+    /** 0 = Glow (moving light behind frosted cards), 1 = Solid, 2 = OLED black. */
+    static int style = 0;
+    static int PARTNER = 0xFFF97316;
+    static final String[] STYLE_NAMES = {"Glow", "Solid", "OLED"};
+    static final String[] STYLE_BLURBS = {"Soft moving light behind frosted cards", "Calm, flat colours", "Pure black, easy on the battery"};
+    static final int[] ACCENT_PARTNER = {0xFFF97316, 0xFF6366F1, 0xFF06B6D4, 0xFFEC4899, 0xFFEF4444, 0xFF94A3B8};
 
     /** Accent families: name, main, deep. Crimson is the brand default. */
     static final String[] ACCENT_NAMES = {"Crimson", "Ocean", "Emerald", "Violet", "Amber", "Mono"};
@@ -43,6 +49,8 @@ final class Ui {
         boolean systemDark = (c.getResources().getConfiguration().uiMode
                 & android.content.res.Configuration.UI_MODE_NIGHT_MASK) == android.content.res.Configuration.UI_MODE_NIGHT_YES;
         dark = mode == 2 || (mode == 0 && systemDark);
+        style = Math.max(0, Math.min(2, p.getInt("style", 0)));
+        PARTNER = ACCENT_PARTNER[accent];
         CRIMSON = ACCENT_MAIN[accent];
         CRIMSON_DARK = ACCENT_DEEP[accent];
         CRIMSON_SOFT = (CRIMSON & 0x00FFFFFF) | 0x33000000;
@@ -51,11 +59,15 @@ final class Ui {
             RAISED = 0xFF22222C; TRACK = 0xFF3A3A48; TEXT = 0xFFF2F2F5; SUB = 0xFF9A9AAB; FAINT = 0xFF5E5E6E;
             RIPPLE = 0x30FFFFFF; SHEET = 0xFF15151C;
             BG_TOP = blend(BG_BOTTOM, CRIMSON, 0.10f);
+            if (style == 2) { BG_BOTTOM = 0xFF000000; BG_TOP = 0xFF000000; SURFACE = 0xFF0E0E12; SURFACE2 = 0xFF16161C; STROKE = 0xFF1E1E26; SHEET = 0xFF0A0A0D; }
+            if (style == 0) { SURFACE = 0xC417171E; SURFACE2 = 0xB3262632; STROKE = 0x26FFFFFF; }
         } else {
             BG_BOTTOM = 0xFFF5F5F8; SURFACE = 0xFFFFFFFF; SURFACE2 = 0xFFF0F0F5; STROKE = 0xFFE3E3EA;
             RAISED = 0xFFFFFFFF; TRACK = 0xFFD9D9E2; TEXT = 0xFF14141A; SUB = 0xFF5C5C6C; FAINT = 0xFF9A9AAB;
             RIPPLE = 0x22000000; SHEET = 0xFFF7F7FA;
             BG_TOP = blend(BG_BOTTOM, CRIMSON, 0.12f);
+            if (style == 2) { BG_BOTTOM = 0xFFFFFFFF; BG_TOP = 0xFFFFFFFF; SURFACE = 0xFFF6F6F8; SURFACE2 = 0xFFEEEEF2; }
+            if (style == 0) { SURFACE = 0xD9FFFFFF; SURFACE2 = 0xBFF2F2F7; STROKE = 0x1A000000; }
         }
     }
 

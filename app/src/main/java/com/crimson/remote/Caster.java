@@ -121,6 +121,41 @@ public class Caster {
     public void pause() throws Exception { soap(controlUrl, "AVTransport", "Pause", "<InstanceID>0</InstanceID>"); }
     public void stop() throws Exception { soap(controlUrl, "AVTransport", "Stop", "<InstanceID>0</InstanceID>"); }
 
+    /** PLAYING, PAUSED_PLAYBACK, STOPPED, TRANSITIONING… or null if the TV didn't answer. */
+    public String transportState() {
+        try {
+            String x = soap(controlUrl, "AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>");
+            int i = x.indexOf("<CurrentTransportState>"), j = x.indexOf("</CurrentTransportState>");
+            return i < 0 || j < 0 ? null : x.substring(i + 23, j);
+        } catch (Exception e) { return null; }
+    }
+
+    /** {position, duration} in seconds, or null. */
+    public long[] position() {
+        try {
+            String x = soap(controlUrl, "AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>");
+            return new long[]{secs(between(x, "RelTime")), secs(between(x, "TrackDuration"))};
+        } catch (Exception e) { return null; }
+    }
+
+    public void seek(int seconds) throws Exception {
+        String t = String.format(java.util.Locale.US, "%02d:%02d:%02d", seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+        soap(controlUrl, "AVTransport", "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>" + t + "</Target>");
+    }
+
+    static String between(String x, String tag) {
+        int i = x.indexOf("<" + tag + ">"), j = x.indexOf("</" + tag + ">");
+        return i < 0 || j < 0 ? "" : x.substring(i + tag.length() + 2, j);
+    }
+
+    static long secs(String hms) {
+        try {
+            String[] p = hms.trim().split(":");
+            if (p.length != 3) return 0;
+            return Long.parseLong(p[0]) * 3600 + Long.parseLong(p[1]) * 60 + (long) Double.parseDouble(p[2]);
+        } catch (Exception e) { return 0; }
+    }
+
     public String kind() {
         return currentType.startsWith("image/") ? "photo" : currentType.startsWith("audio/") ? "music" : "video";
     }
